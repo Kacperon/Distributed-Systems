@@ -6,8 +6,6 @@ PORT = 12345
 MCAST_GRP = '224.1.1.1'
 nick = ""
 
-# --- reader threads ---
-
 def tcp_reader(sock):
     while True:
         data = sock.recv(1024)
@@ -19,7 +17,7 @@ def udp_reader(sock):
     while True:
         data, _ = sock.recvfrom(65535)
         txt = data.decode()
-        # format: "nick\npayload" — skip own messages
+
         sender = txt.split("\n", 1)[0]
         if sender == nick:
             continue
@@ -36,7 +34,6 @@ def mcast_reader(sock):
         payload = txt.split("\n", 1)[1] if "\n" in txt else txt
         print(f"[MCAST from {sender}] {payload}")
 
-# --- main ---
 
 def main():
     global nick
@@ -45,7 +42,7 @@ def main():
     # TCP
     tsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tsock.connect(('localhost', PORT))
-    tsock.recv(1024)  # server prompt
+    tsock.recv(1024)
     tsock.sendall((nick + '\n').encode())
     threading.Thread(target=tcp_reader, args=(tsock,), daemon=True).start()
 

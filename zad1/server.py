@@ -8,7 +8,6 @@ MCAST_GRP = '224.1.1.1'
 clients = {}       
 udp_clients = {} 
 
-# --- TCP ---
 
 def broadcast_tcp(msg, sender_nick=None):
     for nick, sock in list(clients.items()):
@@ -31,7 +30,6 @@ def handle_client(conn, addr):
     conn.close()
     broadcast_tcp(f"*** {nick} left\n")
 
-# --- UDP ---
 
 def udp_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -40,7 +38,6 @@ def udp_listener():
 
     while True:
         data, addr = sock.recvfrom(65535)
-        # format: "nick\npayload"
         txt = data.decode()
         sender = txt.split("\n", 1)[0]
         udp_clients[sender] = addr
