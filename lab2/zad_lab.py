@@ -2,17 +2,17 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict
 
-
 # Task 1 – Doodle API example
 # • Create simple Doodle API
 # • Small API for voting
-# – User can create poll (see what is insider poll)
-# – User can cast a vote inside this polls
-# – User can add, update and delete all information
+#1 – User can create poll (see what is insider poll)
+#2 – User can cast a vote inside this polls
+#3 – User can add, update and delete all information
 # he provides
-# – User can see the results of votes
+#4 – User can see the results of votes
 # • Construct API and build the system
 # – Test it with the Swagger UI
+
 app = FastAPI()
 
 polls = {}
@@ -25,7 +25,7 @@ class Poll(BaseModel):
 class Vote(BaseModel):
 	option: str
 
-# Create poll
+# Create poll 1
 @app.post("/polls")
 def create_poll(poll: Poll):
 	global n
@@ -35,25 +35,25 @@ def create_poll(poll: Poll):
 	n += 1 
 	return {"poll_id": poll_id}
 
-# Get poll
+# Get poll 
 @app.get("/polls/{poll_id}")
 def get_poll(poll_id: str):
 	return polls[poll_id]
 
-# Update poll
+# Update poll 3
 @app.put("/polls/{poll_id}")
 def update_poll(poll_id: str, poll: Poll):
 	polls[poll_id] = poll.model_dump()
 	return polls[poll_id]
 
-# Delete poll
+# Delete poll 3
 @app.delete("/polls/{poll_id}")
 def delete_poll(poll_id: str):
 	polls.pop(poll_id)
 	votes.pop(poll_id)
 	return {"ok": True}
 
-# Vote
+# Vote 2
 @app.post("/polls/{poll_id}/vote")
 def cast_vote(poll_id: str, vote: Vote):
 	v = votes[poll_id]
@@ -63,7 +63,7 @@ def cast_vote(poll_id: str, vote: Vote):
 	v[vote.option] = v.get(vote.option, 0) + 1
 	return {"ok": True}
 
-# Get results
+# Get results 4
 @app.get("/polls/{poll_id}/results")
 def get_results(poll_id: str):
 	return votes[poll_id]
