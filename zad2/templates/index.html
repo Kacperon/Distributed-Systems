@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <title>Plan posiłków - formularz</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <h1>Plan dzienny posiłków</h1>
+    <p>Wypełnij dane, aby wygenerować plan kaloryczny.</p>
+
+    <form method="post" action="/generate">
+      <fieldset>
+        <legend>Informacje o Tobie</legend>
+        <label>
+          Wzrost (cm):<br />
+          <input name="height" type="number" step="1" required />
+        </label>
+        <br />
+        <label>
+          Waga (kg):<br />
+          <input name="weight" type="number" step="0.1" required />
+        </label>
+        <br />
+        <label>
+          Wiek:<br />
+          <input name="age" type="number" step="1" required />
+        </label>
+        <br />
+        <label>
+          Płeć:<br />
+          <select name="gender" required>
+            <option value="m">mężczyzna</option>
+            <option value="f">kobieta</option>
+            <option value="o">inne</option>
+          </select>
+        </label>
+        <br />
+        <label>
+          Poziom aktywności:<br />
+          <select name="activity" required>
+            <option value="low">niska</option>
+            <option value="medium">średnia</option>
+            <option value="high">wysoka</option>
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Preferencje dietetyczne (opcjonalnie)</legend>
+        <label>
+          <select name="preference">
+            <option value="">brak</option>
+            <option value="wegetariańska">wegetariańska</option>
+            <option value="bez nabiału">bez nabiału</option>
+            <option value="mięsożerna">mięsożerna</option>
+          </select>
+        </label>
+      </fieldset>
+
+      <button type="submit">Generuj plan</button>
+    </form>
+
+    <footer>
+      <p>Serwis korzysta z publicznego API TheMealDB do wyboru posiłków.</p>
+    </footer>
+  </body>
+</html>

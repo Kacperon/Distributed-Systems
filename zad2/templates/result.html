@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <title>Plan posiłków - wynik</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <h1>Plan dzienny posiłków</h1>
+
+    {% if error %}
+      <div style="color: red;">
+        <strong>Błąd:</strong> {{ error }}
+      </div>
+    {% else %}
+      <section>
+        <h2>Twoje dane</h2>
+        <ul>
+          <li>wzrost: {{ plan.user.height }} cm</li>
+          <li>waga: {{ plan.user.weight }} kg</li>
+          <li>wiek: {{ plan.user.age }}</li>
+          <li>płeć: {{ plan.user.gender }}</li>
+          <li>aktywność: {{ plan.user.activity }}</li>
+          <li>preferencje: {{ plan.user.preference or "brak" }}</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Kalorie i cel</h2>
+        <ul>
+          <li>BMI: {{ plan.bmi }}</li>
+          <li>Cel: {{ plan.goal }}</li>
+          <li>BMR: ~{{ plan.bmr }} kcal</li>
+          <li>TDEE: ~{{ plan.tdee }} kcal</li>
+          <li>Dzienne zapotrzebowanie: <strong>{{ plan.daily_calories }} kcal</strong></li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Plan posiłków</h2>
+        <table border="1" cellpadding="6" cellspacing="0">
+          <thead>
+            <tr>
+              <th>Posiłek</th>
+              <th>Nazwa produktu</th>
+              <th>Kalorie</th>
+              <th>Białko (g)</th>
+              <th>Węgle (g)</th>
+              <th>Tłuszcz (g)</th>
+              <th>Opis</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for meal in plan.meals %}
+              <tr>
+                <td>{{ meal.type }}</td>
+                <td>{{ meal.name }}</td>
+                <td>{{ meal.calories }}</td>
+                <td>{{ meal.protein }}</td>
+                <td>{{ meal.carbs }}</td>
+                <td>{{ meal.fat }}</td>
+                <td>
+                  <div><strong>Kategoria:</strong> {{ meal.category }}</div>
+                  <div><strong>Kuchnia:</strong> {{ meal.area }}</div>
+                  <div><strong>Składniki:</strong> {{ meal.ingredients_preview }}</div>
+                  {% if meal.source_url %}
+                    <div><a href="{{ meal.source_url }}" target="_blank" rel="noopener">Źródło</a></div>
+                  {% endif %}
+                  {% if meal.youtube %}
+                    <div><a href="{{ meal.youtube }}" target="_blank" rel="noopener">YouTube</a></div>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Makroskładniki</h2>
+        <ul>
+          <li>Kalorie: {{ plan.total.calories }}</li>
+          <li>Białko: {{ plan.total.protein }} g ({{ plan.macros_pct.protein }}%)</li>
+          <li>Węglowodany: {{ plan.total.carbs }} g ({{ plan.macros_pct.carbs }}%)</li>
+          <li>Tłuszcze: {{ plan.total.fat }} g ({{ plan.macros_pct.fat }}%)</li>
+        </ul>
+      </section>
+    {% endif %}
+
+    <p><a href="/">Wróć</a></p>
+  </body>
+</html>
