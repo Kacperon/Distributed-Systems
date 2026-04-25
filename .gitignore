@@ -1,2 +1,77 @@
-__pycache__
+# IDE - IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# IDE - Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# IDE - VS Code
+.vscode/
+*.code-workspace
+
+# IDE - inne
+*.swp
+*.swo
+*~
+
+# Java / Maven
+target/
+*.class
+dependency-reduced-pom.xml
+.mvn/
+
+# Java / Gradle
+.gradle/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# gRPC / proto generowane stuby
+**/generated/
+*_pb2.py
+*_pb2_grpc.py
+*.pb.go
+
+# ICE (lab3)
+**/gen/
+
+# Session / state files (zad4)
+.session_*
+
+# Logi
+*.log
+
+# Pliki wynikowe binarne (do zip-a oddania)
 *.zip
+*.tar.gz
+*.tgz
+
+# Java serializowane obiekty (testowe wyjscie)
+*.ser
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tymczasowe
+*.bak
+*.tmp
+*.orig

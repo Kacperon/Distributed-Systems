@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package can;
+
+option java_package = "edu.sub.proto";
+option java_multiple_files = true;
+
+service CanService {
+  rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeResponse);
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+  rpc GetStats(StatsRequest) returns (MessageStats);
+}
+
+enum MessageCategory {
+  BMS = 0;
+  ENGINE = 1;
+  CHARGER = 2;
+  COOLING = 3;
+  LIGHTS = 4;
+  SENSORS = 5;
+  DASHBOARD = 6;
+  PEDALS = 7;
+  POWER = 8;
+  NODE_STATUS = 9;
+}
+
+message Signal {
+  string name = 1;
+  double value = 2;
+  string unit = 3;
+}
+
+message CanUpdate {
+  string message_name = 1;
+  MessageCategory category = 2;
+  uint64 timestamp_ms = 3;
+  repeated Signal signals = 4;
+}
+
+message Cache {
+  repeated CanUpdate entries = 1;
+}
+
+message SessionInfo {
+  bool resumed = 1;
+  uint32 dropped_count = 2;
+}
+
+message SubscribeRequest {
+  repeated MessageCategory categories = 1;
+  repeated string message_names = 2;
+  bool unsubscribe = 3;
+}
+
+message SubscribeResponse {
+  oneof payload {
+    Cache snapshot = 1;
+    CanUpdate update = 2;
+    SessionInfo session_info = 3;
+  }
+}
+
+message ListMessagesRequest {}
+
+message MessageInfo {
+  string name = 1;
+  MessageCategory category = 2;
+}
+
+message ListMessagesResponse {
+  repeated MessageInfo messages = 1;
+}
+
+message StatsRequest {
+  string message_name = 1;
+}
+
+message MessageStats {
+  uint64 last_seen_ms = 1;
+  uint64 total_count = 2;
+}

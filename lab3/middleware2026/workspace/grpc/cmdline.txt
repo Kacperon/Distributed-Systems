@@ -1,0 +1,12 @@
+protoc -I. --java_out=gen --plugin=protoc-gen-grpc-java='/usr/local/bin/protoc-gen-grpc-java' --grpc-java_out=gen calculator.proto
+protoc -I. --java_out=gen --plugin=protoc-gen-grpc-java='/usr/local/bin/protoc-gen-grpc-java' --grpc-java_out=gen streaming.proto
+
+(wcześniej: maven package)
+java -cp "target/classes/:target/lib/*" sr.grpc.server.grpcServer 
+java -cp "target/classes/:target/lib/*" sr.grpc.client.grpcClient
+
+NGINX:
+apt update; apt install nginx
+nginx -t -c /workspace/grpc/nginx.conf (sprawdzenie pliku konfiguracyjnego)
+nginx -c /workspace/grpc/nginx.conf (uruchomienie)
+https://nginx.org/en/docs/switches.html (zatrzymanie itp.)

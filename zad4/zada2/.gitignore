@@ -1,0 +1,30 @@
+# Java / Maven
+server/target/
+*.class
+dependency-reduced-pom.xml
+
+# Python
+client/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generowane stuby (regenerowane z proto)
+client/generated/
+
+# Pliki sesji klienta (per-instancja UUID)
+client/.session_*
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logi
+*.log

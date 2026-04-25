@@ -2,11 +2,12 @@ import socket
 import threading
 import struct
 
-PORT = 12345
+PORT = 12346
 MCAST_GRP = '224.1.1.1'
 
 clients = {}       
-udp_clients = {} 
+# Track UDP peers by address, not nick, to avoid collisions when nicks repeat.
+udp_clients = set()
 
 
 def broadcast_tcp(msg, sender_nick=None):
@@ -38,11 +39,12 @@ def udp_listener():
 
     while True:
         data, addr = sock.recvfrom(65535)
-        txt = data.decode()
-        sender = txt.split("\n", 1)[0]
-        udp_clients[sender] = addr
-        for nick, a in list(udp_clients.items()):
-            if nick != sender:
+        print(f"[UDP recv] {addr} bytes={len(data)}")
+        udp_clients.add(addr)
+        # Fan-out to every known peer except the sender.
+        for a in list(udp_clients):
+            if a != addr:
+                print(f"[UDP send] -> {a} bytes={len(data)}")
                 sock.sendto(data, a)
 
 

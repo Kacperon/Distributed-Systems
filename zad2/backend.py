@@ -342,10 +342,7 @@ def validation_error_to_text(exc: ValidationError) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    try:
-        return templates.TemplateResponse(request, "index.html", {"request": request})
-    except Exception as e:
-        return templates.TemplateResponse(request, "result.html", {"request": request, "error": str(e)}, status_code=status.HTTP_400_BAD_REQUEST)
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 @app.post("/generate", response_class=HTMLResponse)
@@ -362,14 +359,12 @@ async def generate(request: Request):
         payload = UserInput.model_validate(raw_data)
     except ValidationError as e:
         return templates.TemplateResponse(
-            request,
             "result.html",
             {"request": request, "error": f"Błędne dane wejściowe: {validation_error_to_text(e)}"},
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     except Exception as e:
         return templates.TemplateResponse(
-            request,
             "result.html",
             {"request": request, "error": f"Błędne dane wejściowe: {e}"},
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -391,7 +386,6 @@ async def generate(request: Request):
         )
     except Exception as e:
         return templates.TemplateResponse(
-            request,
             "result.html",
             {"request": request, "error": f"Błąd podczas generowania planu: {e}"},
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -402,7 +396,7 @@ async def generate(request: Request):
     if accept_header.lower().startswith("application/json") or request.query_params.get("format") == "json":
         return JSONResponse(plan)
 
-    return templates.TemplateResponse(request, "result.html", {"request": request, "plan": plan})
+    return templates.TemplateResponse("result.html", {"request": request, "plan": plan})
 
 
 @app.post("/api/generate")

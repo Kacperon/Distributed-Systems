@@ -2,8 +2,9 @@ import socket
 import threading
 import struct
 
-PORT = 12345
+PORT = 12346
 MCAST_GRP = '224.1.1.1'
+SERVER_HOST = '127.0.0.1'  # change to server's IP when clients run on other machines
 nick = ""
 
 def tcp_reader(sock):
@@ -41,7 +42,7 @@ def main():
 
     # TCP
     tsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tsock.connect(('localhost', PORT))
+    tsock.connect((SERVER_HOST, PORT))
     tsock.recv(1024)
     tsock.sendall((nick + '\n').encode())
     threading.Thread(target=tcp_reader, args=(tsock,), daemon=True).start()
@@ -50,6 +51,8 @@ def main():
     usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     usock.bind(("", 0))
     threading.Thread(target=udp_reader, args=(usock,), daemon=True).start()
+    # Register this client's UDP endpoint with the server so others can reach it.
+    usock.sendto(f"{nick}\n__hello__".encode(), (SERVER_HOST, PORT))
 
     # Multicast
     msock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -65,7 +68,9 @@ def main():
         if line == 'U':
             art = open('art.txt').read()
             # prepend nick so server and receivers know who sent it
-            usock.sendto(f"{nick}\n{art}".encode(), ('localhost', PORT))
+            payload = f"{nick}\n{art}".encode()
+            print(f"[UDP send] -> {(SERVER_HOST, PORT)} bytes={len(payload)}")
+            usock.sendto(payload, (SERVER_HOST, PORT))
         elif line == 'M':
             msg = input('mcast> ')
             msock.sendto(f"{nick}\n{msg}".encode(), (MCAST_GRP, PORT))

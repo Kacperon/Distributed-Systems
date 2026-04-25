@@ -1,0 +1,5 @@
+eu.news.sport Mecz
+us.news.sport NBA final
+eu.pl.weather Slonecznie
+us.la.weather 25C
+eu.news.sport.football.live Breaking

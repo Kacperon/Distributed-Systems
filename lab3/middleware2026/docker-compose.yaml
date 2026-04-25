@@ -1,0 +1,12 @@
+services:
+  middleware2026-lab:
+    build: .
+    container_name: middleware2026
+    volumes:
+      - ./workspace:/workspace
+    ports:
+      - "10010:10010/tcp"  		# Ice
+      - "10010:10010/udp"  		# Ice
+      - "9090-9091:9090-9091/tcp"    	# Thrift
+      - "50041:50041/tcp"  		# gRPC
+    tty: true
