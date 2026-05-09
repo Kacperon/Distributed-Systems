@@ -1,0 +1,92 @@
+title: |md
+  # System posrednictwa - RabbitMQ
+  topic exchange `space.events`, klucze: `order.<typ>`, `confirm.<agencja>`, `broadcast.<grupa>`
+| {near: top-center}
+
+direction: right
+
+classes: {
+  agency:   { shape: person; style.fill: "#bfdbfe" }
+  carrier:  { shape: person; style.fill: "#fde68a" }
+  admin:    { shape: person; style.fill: "#fca5a5" }
+  exch:     { shape: hexagon; style.fill: "#fef3c7"; style.stroke-width: 3; style.font-size: 22 }
+  workq:    { shape: queue; style.fill: "#fde68a" }
+  agencyq:  { shape: queue; style.fill: "#bfdbfe" }
+  carrierq: { shape: queue; style.fill: "#fde68a" }
+  adminq:   { shape: queue; style.fill: "#fca5a5" }
+  ord:  { style.stroke: "#1d4ed8"; style.stroke-width: 2 }
+  conf: { style.stroke: "#a16207"; style.stroke-width: 2 }
+  brd:  { style.stroke: "#b91c1c"; style.stroke-width: 2 }
+  cons: { style.stroke: "#16a34a"; style.stroke-dash: 3; style.stroke-width: 2 }
+}
+
+P: "Producenci" {
+  style.fill: "#f8fafc"
+  pNASA:  "Agencja NASA"  { class: agency }
+  pESA:   "Agencja ESA"   { class: agency }
+  pADM:   "Administrator" { class: admin }
+  pC1:    "Przewoznik C1" { class: carrier }
+  pC2:    "Przewoznik C2" { class: carrier }
+}
+
+EX: "space.events\n(topic exchange)" { class: exch }
+
+Q: "Kolejki" {
+  style.fill: "#f8fafc"
+  Q_OS:   "service.osoby"     { class: workq }
+  Q_LA:   "service.ladunek"   { class: workq }
+  Q_SA:   "service.satelita"  { class: workq }
+  Q_NASA: "agency.NASA"       { class: agencyq }
+  Q_ESA:  "agency.ESA"        { class: agencyq }
+  Q_C1:   "carrier.C1"        { class: carrierq }
+  Q_C2:   "carrier.C2"        { class: carrierq }
+  Q_ADM:  "admin.<auto>"      { class: adminq }
+}
+
+C: "Konsumenci" {
+  style.fill: "#f8fafc"
+  cNASA: "Agencja NASA"            { class: agency }
+  cESA:  "Agencja ESA"             { class: agency }
+  cC1:   "Przewoznik C1\n[osoby, ladunek]"   { class: carrier }
+  cC2:   "Przewoznik C2\n[ladunek, satelita]" { class: carrier }
+  cADM:  "Administrator"           { class: admin }
+}
+
+# === publish: producent -> exchange (klucz routingu) ===
+P.pNASA -> EX: "order.<typ>"          { class: ord }
+P.pESA  -> EX: "order.<typ>"          { class: ord }
+P.pC1   -> EX: "confirm.<agencja>"    { class: conf }
+P.pC2   -> EX: "confirm.<agencja>"    { class: conf }
+P.pADM  -> EX: "broadcast.<grupa>"    { class: brd }
+
+# === bindings: exchange -> kolejki ===
+EX -> Q.Q_OS:   "order.osoby"    { class: ord }
+EX -> Q.Q_LA:   "order.ladunek"  { class: ord }
+EX -> Q.Q_SA:   "order.satelita" { class: ord }
+EX -> Q.Q_NASA: "confirm.NASA, broadcast.agencies, broadcast.all" { class: conf }
+EX -> Q.Q_ESA:  "confirm.ESA, broadcast.agencies, broadcast.all"  { class: conf }
+EX -> Q.Q_C1:   "broadcast.carriers, broadcast.all" { class: brd }
+EX -> Q.Q_C2:   "broadcast.carriers, broadcast.all" { class: brd }
+EX -> Q.Q_ADM:  "order.*, confirm.*, broadcast.*"   { class: brd }
+
+# === consume: kolejka -> konsument ===
+Q.Q_OS   -> C.cC1:  "consume" { class: cons }
+Q.Q_LA   -> C.cC1:  "consume" { class: cons }
+Q.Q_LA   -> C.cC2:  "consume" { class: cons }
+Q.Q_SA   -> C.cC2:  "consume" { class: cons }
+Q.Q_NASA -> C.cNASA            { class: cons }
+Q.Q_ESA  -> C.cESA             { class: cons }
+Q.Q_C1   -> C.cC1              { class: cons }
+Q.Q_C2   -> C.cC2              { class: cons }
+Q.Q_ADM  -> C.cADM             { class: cons }
+
+legend: "Legenda" {
+  near: bottom-right
+  shape: rectangle
+  grid-columns: 1
+  grid-gap: 4
+  l1: "niebieski - zlecenia (order.*)"           { shape: text; style.font-color: "#1d4ed8" }
+  l2: "brazowy - potwierdzenia (confirm.*)"      { shape: text; style.font-color: "#a16207" }
+  l3: "czerwony - administrator (broadcast.*)"   { shape: text; style.font-color: "#b91c1c" }
+  l4: "zielony przerywany - konsumpcja"          { shape: text; style.font-color: "#16a34a" }
+}
