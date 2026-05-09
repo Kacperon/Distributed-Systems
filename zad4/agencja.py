@@ -4,11 +4,11 @@ import threading
 
 import pika
 
-from common import EXCHANGE, SERVICES, host
+from common import EXCHANGE, SERVICES, HOST
 
 
 def consumer(name):
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=host()))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
     queue = f'agency.{name}'
@@ -23,7 +23,7 @@ def consumer(name):
         if rk.startswith('confirm.'):
             print(f"\n[CONFIRM] order #{msg['order_id']} ({msg['service']}) done by carrier {msg['carrier']}")
         else:
-            print(f"\n[ADMIN -> {rk}] {msg.get('text', '')}")
+            print(f"\n[ADMIN -> {rk}] {msg['text']}")
         print(f'{name}> ', end='', flush=True)
 
     ch.basic_consume(queue=queue, on_message_callback=cb, auto_ack=True)
@@ -37,7 +37,7 @@ def main():
 
     threading.Thread(target=consumer, args=(name,), daemon=True).start()
 
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=host()))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
 

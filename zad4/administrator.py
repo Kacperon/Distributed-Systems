@@ -1,10 +1,9 @@
 import json
-import sys
 import threading
 
 import pika
 
-from common import EXCHANGE, host
+from common import EXCHANGE, HOST
 
 
 TARGETS = {
@@ -15,7 +14,7 @@ TARGETS = {
 
 
 def consumer():
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=host()))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
     q = ch.queue_declare(queue='', exclusive=True).method.queue
@@ -35,7 +34,7 @@ def consumer():
 def main():
     threading.Thread(target=consumer, daemon=True).start()
 
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=host()))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
 

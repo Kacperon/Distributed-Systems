@@ -3,7 +3,7 @@ import sys
 
 import pika
 
-from common import EXCHANGE, SERVICES, host
+from common import EXCHANGE, SERVICES, HOST
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
     if len(set(services)) != 2 or any(s not in SERVICES for s in services):
         sys.exit(f'must give 2 distinct services from: {", ".join(SERVICES)}')
 
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=host()))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
 
@@ -32,25 +32,15 @@ def main():
 
     def order_cb(ch_, method, props, body):
         msg = json.loads(body)
-        service = method.routing_key.split('.', 1)[1]
-        print(f"[ORDER] {msg['agency']} #{msg['order_id']} {service}")
-        confirm = {
-            'agency': msg['agency'],
-            'order_id': msg['order_id'],
-            'service': service,
-            'carrier': carrier_id,
-        }
-        ch_.basic_publish(
-            exchange=EXCHANGE,
-            routing_key=f"confirm.{msg['agency']}",
-            body=json.dumps(confirm),
-        )
+        print(f"[ORDER] {msg['agency']} #{msg['order_id']} {msg['service']}")
+        confirm = dict(msg, carrier=carrier_id)
+        ch_.basic_publish(EXCHANGE, f"confirm.{msg['agency']}", json.dumps(confirm))
         ch_.basic_ack(method.delivery_tag)
         print(f"  confirmed {msg['agency']} #{msg['order_id']}")
 
     def broadcast_cb(ch_, method, props, body):
         msg = json.loads(body)
-        print(f"[ADMIN -> {method.routing_key}] {msg.get('text', '')}")
+        print(f"[ADMIN -> {method.routing_key}] {msg['text']}")
 
     for s in services:
         ch.basic_consume(queue=f'service.{s}', on_message_callback=order_cb)
