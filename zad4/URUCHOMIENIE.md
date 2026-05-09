@@ -16,7 +16,7 @@
 | `przewoznik.py`   | klient przewoznika (sluch zlecen, publikuje potwierdzenia)  |
 | `administrator.py`| szpieg + nadawca broadcastow                                |
 | `schemat.d2`      | zrodlo diagramu                                             |
-| `schemat.svg/png` | wyrenderowany diagram (`d2 --layout=elk schemat.d2 ...`)    |
+| `schemat.svg/png` | wyrenderowany diagram (`d2 --layout=dagre schemat.d2 ...`)  |
 | `schemat.md`      | tabela z kolejkami, kluczami i wiazaniami + osadzony diagram|
 
 ## Architektura — co i dlaczego
@@ -125,7 +125,7 @@ python przewoznik.py C2 ladunek satelita          # przewoznik 2
 
 ## Uwagi co do oddania
 
-- Diagram (`schemat.svg`/`schemat.png`) jest postaci elektronicznej, wygenerowany z `schemat.d2` przez d2 z layoutem ELK — zaden skan recznego rysunku.
+- Diagram (`schemat.svg`/`schemat.png`) jest postaci elektronicznej, wygenerowany z `schemat.d2` przez d2 z layoutem dagre — zaden skan recznego rysunku.
 - Jezyk: Python 3 z `pika`. Bez stub'ow — RabbitMQ nie wymaga IDL.
 - Komunikaty agencja/przewoznik nie maja stempla czasowego ani signatur — celowo proste, brief tego nie wymaga.
 - Po `Ctrl+C`/`quit` exclusive queues znikaja same z RabbitMQ. Kolejki robocze `service.*` zostaja, ale sa puste.

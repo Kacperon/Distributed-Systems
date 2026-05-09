@@ -37,6 +37,6 @@ Kolejki `agency.*` oraz `carrier.*` sa exclusive — jeden konsument na kolejke.
 
 ## Diagram
 
-Zrodlo: [`schemat.d2`](schemat.d2). Render: `d2 --layout=elk schemat.d2 schemat.svg` (lub `schemat.png`).
+Zrodlo: [`schemat.d2`](schemat.d2). Render: `d2 --layout=dagre schemat.d2 schemat.svg` (lub `schemat.png`).
 
 ![schemat](schemat.svg)

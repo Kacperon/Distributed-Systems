@@ -17,7 +17,10 @@ classes: {
   ord:  { style.stroke: "#1d4ed8"; style.stroke-width: 2 }
   conf: { style.stroke: "#a16207"; style.stroke-width: 2 }
   brd:  { style.stroke: "#b91c1c"; style.stroke-width: 2 }
-  cons: { style.stroke: "#16a34a"; style.stroke-dash: 3; style.stroke-width: 2 }
+  cons-work:   { style.stroke: "#ea580c"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-agency: { style.stroke: "#2563eb"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-carrier:{ style.stroke: "#ca8a04"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-admin:  { style.stroke: "#dc2626"; style.stroke-dash: 5; style.stroke-width: 2 }
 }
 
 P: "Producenci" {
@@ -52,7 +55,7 @@ C: "Konsumenci" {
   cADM:  "Administrator"           { class: admin }
 }
 
-# === publish: producent -> exchange (klucz routingu) ===
+# === publish: producent -> exchange ===
 P.pNASA -> EX: "order.<typ>"          { class: ord }
 P.pESA  -> EX: "order.<typ>"          { class: ord }
 P.pC1   -> EX: "confirm.<agencja>"    { class: conf }
@@ -69,24 +72,27 @@ EX -> Q.Q_C1:   "broadcast.carriers, broadcast.all" { class: brd }
 EX -> Q.Q_C2:   "broadcast.carriers, broadcast.all" { class: brd }
 EX -> Q.Q_ADM:  "order.*, confirm.*, broadcast.*"   { class: brd }
 
-# === consume: kolejka -> konsument ===
-Q.Q_OS   -> C.cC1:  "consume" { class: cons }
-Q.Q_LA   -> C.cC1:  "consume" { class: cons }
-Q.Q_LA   -> C.cC2:  "consume" { class: cons }
-Q.Q_SA   -> C.cC2:  "consume" { class: cons }
-Q.Q_NASA -> C.cNASA            { class: cons }
-Q.Q_ESA  -> C.cESA             { class: cons }
-Q.Q_C1   -> C.cC1              { class: cons }
-Q.Q_C2   -> C.cC2              { class: cons }
-Q.Q_ADM  -> C.cADM             { class: cons }
+# === consume: kolejka -> konsument (kolor po typie kolejki) ===
+Q.Q_OS   -> C.cC1   { class: cons-work }
+Q.Q_LA   -> C.cC1   { class: cons-work }
+Q.Q_LA   -> C.cC2   { class: cons-work }
+Q.Q_SA   -> C.cC2   { class: cons-work }
+Q.Q_NASA -> C.cNASA { class: cons-agency }
+Q.Q_ESA  -> C.cESA  { class: cons-agency }
+Q.Q_C1   -> C.cC1   { class: cons-carrier }
+Q.Q_C2   -> C.cC2   { class: cons-carrier }
+Q.Q_ADM  -> C.cADM  { class: cons-admin }
 
 legend: "Legenda" {
   near: bottom-right
   shape: rectangle
   grid-columns: 1
   grid-gap: 4
-  l1: "niebieski - zlecenia (order.*)"           { shape: text; style.font-color: "#1d4ed8" }
-  l2: "brazowy - potwierdzenia (confirm.*)"      { shape: text; style.font-color: "#a16207" }
-  l3: "czerwony - administrator (broadcast.*)"   { shape: text; style.font-color: "#b91c1c" }
-  l4: "zielony przerywany - konsumpcja"          { shape: text; style.font-color: "#16a34a" }
+  l1: "ciagle niebieskie - zlecenia (order.*)"            { shape: text; style.font-color: "#1d4ed8" }
+  l2: "ciagle brazowe - potwierdzenia (confirm.*)"        { shape: text; style.font-color: "#a16207" }
+  l3: "ciagle czerwone - administrator (broadcast.*)"     { shape: text; style.font-color: "#b91c1c" }
+  l4: "kreskowane pomaranczowe - consume z service.*"      { shape: text; style.font-color: "#ea580c" }
+  l5: "kreskowane niebieskie - consume z agency.*"         { shape: text; style.font-color: "#2563eb" }
+  l6: "kreskowane zolte - consume z carrier.*"             { shape: text; style.font-color: "#ca8a04" }
+  l7: "kreskowane czerwone - consume z admin.<auto>"       { shape: text; style.font-color: "#dc2626" }
 }
