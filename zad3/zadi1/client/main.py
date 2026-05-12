@@ -1,300 +1,195 @@
+import os
 import sys
+import uuid
+import queue
+import time
 
-import grpc
-
-from google.protobuf import descriptor_pb2, descriptor_pool
-from google.protobuf.message_factory import GetMessageClass
-from grpc_reflection.v1alpha import reflection_pb2, reflection_pb2_grpc
-
-
-DEFAULT_TARGET = "localhost:50061"
+import Ice
 
 
-def list_services(stub):
-    req = reflection_pb2.ServerReflectionRequest(list_services="")
-    resp = list(stub.ServerReflectionInfo(iter([req])))[0]
-    return [s.name for s in resp.list_services_response.service]
+SLICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog.ice")
+DEFAULT_PROXY = "catalog:tcp -h localhost -p 10000"
 
 
-def parse_file_descriptors(responses):
-    out = []
-    for resp in responses:
-        if resp.HasField("error_response"):
-            raise RuntimeError(f"reflection error: {resp.error_response.error_message}")
-        if resp.HasField("file_descriptor_response"):
-            for raw in resp.file_descriptor_response.file_descriptor_proto:
-                fdp = descriptor_pb2.FileDescriptorProto()
-                fdp.ParseFromString(raw)
-                out.append(fdp)
-    return out
+Ice.loadSlice(f"-I. -I{os.path.dirname(SLICE_FILE)} {SLICE_FILE}")
+import library
 
 
-def fetch_by_symbol(stub, symbol):
-    req = reflection_pb2.ServerReflectionRequest(file_containing_symbol=symbol)
-    return parse_file_descriptors(stub.ServerReflectionInfo(iter([req])))
+class BookStreamI(library.BookStream):
+    def __init__(self):
+        self.q = queue.Queue()
+
+    def onNext(self, book, current=None):
+        self.q.put(("next", book))
+
+    def onCompleted(self, current=None):
+        self.q.put(("done", None))
+
+    def onError(self, code, message, current=None):
+        self.q.put(("error", (code, message)))
 
 
-def fetch_by_filename(stub, filename):
-    req = reflection_pb2.ServerReflectionRequest(file_by_filename=filename)
-    return parse_file_descriptors(stub.ServerReflectionInfo(iter([req])))
-
-
-def load_pool(stub, services):
-    pool = descriptor_pool.DescriptorPool()
-    loaded = set()
-
-    def add(fdp):
-        if fdp.name in loaded:
-            return
-        for dep in fdp.dependency:
-            if dep not in loaded:
-                for sub in fetch_by_filename(stub, dep):
-                    add(sub)
-        pool.Add(fdp)
-        loaded.add(fdp.name)
-
-    for svc in services:
-        for fdp in fetch_by_symbol(stub, svc):
-            add(fdp)
-    return pool
-
-
-class Method:
-    def __init__(self, service_full_name, method_desc):
-        self.service = service_full_name
-        self.name = method_desc.name
-        self.path = f"/{service_full_name}/{method_desc.name}"
-        self.input_desc = method_desc.input_type
-        self.output_desc = method_desc.output_type
-        self.input_class = GetMessageClass(method_desc.input_type)
-        self.output_class = GetMessageClass(method_desc.output_type)
-        self.client_streaming = method_desc.client_streaming
-        self.server_streaming = method_desc.server_streaming
-
-
-def discover_methods(pool, services):
-    out = {}
-    for svc_name in services:
-        svc = pool.FindServiceByName(svc_name)
-        for m in svc.methods:
-            out[(svc_name, m.name)] = Method(svc_name, m)
-    return out
-
-
-def call_unary(channel, method, req):
-    rpc = channel.unary_unary(
-        method.path,
-        request_serializer=method.input_class.SerializeToString,
-        response_deserializer=method.output_class.FromString,
-    )
-    return rpc(req)
-
-
-def call_server_stream(channel, method, req):
-    rpc = channel.unary_stream(
-        method.path,
-        request_serializer=method.input_class.SerializeToString,
-        response_deserializer=method.output_class.FromString,
-    )
-    return rpc(req)
-
-
-def format_value(v, indent=0):
-    spaces = "  " * indent
-    if hasattr(v, "DESCRIPTOR"):
-        return format_message(v, indent)
-    if isinstance(v, list):
-        if not v:
-            return "[]"
-        return f"[\n{spaces}  " + f",\n{spaces}  ".join(format_value(x, indent + 1) for x in v) + f"\n{spaces}]"
-    if isinstance(v, dict):
-        if not v:
-            return "{}"
-        items = [f"{k}: {format_value(val, indent + 1)}" for k, val in v.items()]
-        return "{\n" + spaces + "  " + f",\n{spaces}  ".join(items) + f"\n{spaces}}}"
-    return repr(v)
-
-
-def format_message(msg, indent=0):
-    spaces = "  " * indent
-    lines = []
-    for field in msg.DESCRIPTOR.fields:
-        v = getattr(msg, field.name)
-        if field.message_type and field.message_type.full_name == "google.protobuf.Empty":
-            continue
-        if not v and (field.label != field.LABEL_REPEATED or isinstance(v, (list, dict))):
-            continue
-        lines.append(f"{field.name}: {format_value(v, indent + 1)}")
-    return "{\n" + spaces + "  " + f",\n{spaces}  ".join(lines) + f"\n{spaces}}}"
-
-
-def read_field(field_desc, indent=0):
-    name = field_desc.name
-    is_repeated = field_desc.label == field_desc.LABEL_REPEATED
-
-    spaces = "  " * indent
-    if field_desc.message_type and field_desc.message_type.full_name == "google.protobuf.Empty":
-        return None
-
-    if is_repeated:
-        val_str = input(f"{spaces}{name} (comma-separated, optional): ").strip()
-        if not val_str:
-            return []
-        if field_desc.type == field_desc.TYPE_INT32 or field_desc.type == field_desc.TYPE_INT64:
+def call_find_by_author(communicator, adapter, prx, author, limit, timeout=10.0):
+    servant = BookStreamI()
+    cb_id = Ice.Identity()
+    cb_id.name = "stream-" + uuid.uuid4().hex
+    cb_id.category = ""
+    cb_prx = library.BookStreamPrx.uncheckedCast(adapter.add(servant, cb_id))
+    try:
+        prx.findByAuthor(library.AuthorQuery(author, limit), cb_prx)
+        results = []
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
             try:
-                return [int(x.strip()) for x in val_str.split(",")]
-            except ValueError:
-                print(f"{spaces}  invalid int list")
-                return []
-        return [x.strip() for x in val_str.split(",")]
-
-    if field_desc.type == field_desc.TYPE_INT32 or field_desc.type == field_desc.TYPE_INT64:
-        val_str = input(f"{spaces}{name} (int, optional): ").strip()
-        return int(val_str) if val_str else 0
-
-    if field_desc.type == field_desc.TYPE_STRING:
-        return input(f"{spaces}{name}: ").strip()
-
-    if field_desc.message_type:
-        print(f"{spaces}{name} ({field_desc.message_type.name}):")
-        return read_message(field_desc.message_type, indent + 1)
-
-    return None
+                kind, val = servant.q.get(timeout=remaining if remaining > 0 else 0.01)
+            except queue.Empty:
+                raise RuntimeError("findByAuthor: timed out waiting for stream completion")
+            if kind == "next":
+                results.append(val)
+            elif kind == "done":
+                return results
+            elif kind == "error":
+                code, msg = val
+                raise RuntimeError(f"findByAuthor stream error: {code}: {msg}")
+    finally:
+        adapter.remove(cb_id)
 
 
-def read_message(msg_desc, indent=0):
-    kwargs = {}
-    for field in msg_desc.fields:
-        val = read_field(field, indent)
-        if val is not None:
-            kwargs[field.name] = val
-    msg_class = GetMessageClass(msg_desc)
-    return msg_class(**kwargs)
+def print_book(b, indent=0):
+    s = "  " * indent
+    tags = list(b.tags) if b.tags else []
+    print(f"{s}id={b.id} year={b.year} title={b.title!r} author={b.author!r} tags={tags}")
 
 
-def format_field(field, value, indent=0):
-    spaces = "  " * indent
-    if field.message_type and field.message_type.full_name == "google.protobuf.Empty":
-        return None
-    if not value and (field.label != field.LABEL_REPEATED):
-        return None
-
-    if field.message_type and field.message_type.has_options and field.message_type.GetOptions().map_entry:
-        if not value:
-            return None
-        items = [f"{k}: {repr(v)}" for k, v in value.items()]
-        return f"{field.name}: {{{', '.join(items)}}}"
-
-    if field.label == field.LABEL_REPEATED:
-        if not value:
-            return None
-        if field.message_type and not (field.message_type.has_options and field.message_type.GetOptions().map_entry):
-            items = [format_message(v, indent + 1) for v in value]
-        else:
-            items = [repr(v) for v in value]
-        return f"{field.name}: [\n{spaces}  " + f",\n{spaces}  ".join(items) + f"\n{spaces}]"
-
-    if field.message_type:
-        return f"{field.name}: {format_message(value, indent + 1)}"
-
-    return f"{field.name}: {repr(value)}"
+def print_stats(stats):
+    print(f"  total: {stats.total}")
+    print(f"  byAuthor:")
+    for k, v in sorted(stats.byAuthor.items()):
+        print(f"    {k!r}: {v}")
+    print(f"  recent ({len(stats.recent)}):")
+    for b in stats.recent:
+        print_book(b, 2)
 
 
-def print_response(resp, indent=0):
-    spaces = "  " * indent
-    if not hasattr(resp, "DESCRIPTOR"):
-        print(f"{spaces}{repr(resp)}")
-        return
-    for field in resp.DESCRIPTOR.fields:
-        formatted = format_field(field, getattr(resp, field.name), indent)
-        if formatted:
-            print(f"{spaces}{formatted}")
+def read_int(prompt, default=0):
+    s = input(prompt).strip()
+    if not s:
+        return default
+    try:
+        return int(s)
+    except ValueError:
+        print("  invalid int, using 0")
+        return 0
 
 
-def menu_loop(channel, methods):
-    sorted_methods = sorted(methods.items())
+def read_csv(prompt):
+    s = input(prompt).strip()
+    if not s:
+        return []
+    return [t.strip() for t in s.split(",")]
 
+
+OPERATIONS = [
+    ("addBook", "AddBookRequest", "AddBookResult"),
+    ("findByAuthor", "AuthorQuery + BookStream*", "void (stream via callback)"),
+    ("summary", "void", "CatalogStats"),
+    ("removeBook", "int", "RemoveBookResult"),
+]
+
+
+def menu_loop(communicator, adapter, prx):
     while True:
-        print("\navailable methods:")
-        for i, ((svc, name), m) in enumerate(sorted_methods, 1):
-            flags = []
-            if m.client_streaming:
-                flags.append("client-stream")
-            if m.server_streaming:
-                flags.append("server-stream")
-            extra = f" [{','.join(flags)}]" if flags else ""
-            print(f"{i}) {svc}/{name}{extra}")
-        print("q) quit")
-
+        print("\navailable operations:")
+        for i, (name, in_t, out_t) in enumerate(OPERATIONS, 1):
+            print(f"  {i}) {name}    in={in_t}    out={out_t}")
+        print("  5) ice_ids  (introspection)")
+        print("  6) ice_ping (introspection)")
+        print("  q) quit")
         try:
             choice = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
-            break
-
+            return
         if choice in ("q", "quit", "exit"):
-            break
-
+            return
         try:
-            idx = int(choice) - 1
-            if idx < 0 or idx >= len(sorted_methods):
-                print("invalid choice")
-                continue
-
-            (svc, name), method = sorted_methods[idx]
-
-            print(f"calling {svc}/{name}")
-            print(f"input type: {method.input_desc.full_name}")
-            req = read_message(method.input_desc)
-            print("sending request:")
-            print_response(req)
-
-            if method.server_streaming:
-                print("response (streaming):")
-                got = 0
-                for resp in call_server_stream(channel, method, req):
-                    got += 1
-                    print(f"[{got}]")
-                    print_response(resp, 1)
-                print(f"received {got} messages")
-            else:
+            if choice == "1":
+                title = input("title: ").strip()
+                author = input("author: ").strip()
+                year = read_int("year (int): ")
+                tags = read_csv("tags (comma-separated, optional): ")
+                req = library.AddBookRequest(title, author, year, tags)
+                res = prx.addBook(req)
+                if res.errorCode:
+                    print(f"  ERROR {res.errorCode}: {res.errorMessage}")
+                else:
+                    print(f"  bookId={res.bookId}")
+            elif choice == "2":
+                author = input("author: ").strip()
+                limit = read_int("limit (0 = no limit): ")
+                results = call_find_by_author(communicator, adapter, prx, author, limit)
+                print(f"streamed {len(results)} books:")
+                for b in results:
+                    print_book(b, 1)
+            elif choice == "3":
+                stats = prx.summary()
                 print("response:")
-                resp = call_unary(channel, method, req)
-                print_response(resp, 1)
-        except grpc.RpcError as e:
-            print(f"rpc error: code={e.code()} details={e.details()}")
-        except ValueError as e:
-            print(f"input error: {e}")
-        except Exception as e:
+                print_stats(stats)
+            elif choice == "4":
+                bid = read_int("book id (int): ")
+                res = prx.removeBook(bid)
+                if res.errorCode:
+                    print(f"  ERROR {res.errorCode}: {res.errorMessage}")
+                else:
+                    print(f"  removed (ok={res.ok})")
+            elif choice == "5":
+                ids = prx.ice_ids()
+                print("ice_ids:")
+                for x in ids:
+                    print(f"  {x}")
+            elif choice == "6":
+                prx.ice_ping()
+                print("ice_ping: OK")
+            else:
+                print("invalid choice")
+        except Ice.LocalException as e:
+            print(f"ice error: {type(e).__name__}: {e}")
+        except RuntimeError as e:
             print(f"error: {e}")
 
 
 def main():
-    target = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGET
-    print(f"connecting to {target}")
-    channel = grpc.insecure_channel(target)
-    refl_stub = reflection_pb2_grpc.ServerReflectionStub(channel)
-
+    proxy_str = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROXY
+    print(f"connecting via proxy: {proxy_str!r}")
+    communicator = Ice.initialize(sys.argv)
     try:
-        services = [s for s in list_services(refl_stub) if not s.startswith("grpc.reflection.")]
-    except grpc.RpcError as e:
-        print(f"could not reach server at {target}: code={e.code()} details={e.details()}")
-        channel.close()
-        sys.exit(1)
-
-    print(f"discovered services: {', '.join(services)}")
-    pool = load_pool(refl_stub, services)
-    methods = discover_methods(pool, services)
-
-    if not methods:
-        print("no methods available")
-        channel.close()
-        sys.exit(1)
-
-    try:
-        menu_loop(channel, methods)
+        base = communicator.stringToProxy(proxy_str)
+        if base is None:
+            print("could not parse proxy string")
+            sys.exit(1)
+        try:
+            base.ice_ping()
+        except Ice.LocalException as e:
+            print(f"could not reach server: {type(e).__name__}: {e}")
+            sys.exit(1)
+        try:
+            type_ids = base.ice_ids()
+            print(f"discovered ice_ids: {type_ids}")
+        except Ice.LocalException as e:
+            print(f"ice_ids failed: {e}")
+        prx = library.CatalogPrx.checkedCast(base)
+        if prx is None:
+            print("proxy does not expose ::library::Catalog")
+            sys.exit(1)
+        adapter = communicator.createObjectAdapterWithEndpoints("CallbackAdapter", "tcp -h 127.0.0.1")
+        adapter.activate()
+        try:
+            menu_loop(communicator, adapter, prx)
+        finally:
+            adapter.deactivate()
     finally:
-        channel.close()
+        communicator.destroy()
 
 
 if __name__ == "__main__":

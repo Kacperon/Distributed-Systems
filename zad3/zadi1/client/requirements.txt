@@ -1,3 +1,1 @@
-grpcio>=1.62
-grpcio-reflection>=1.62
-protobuf>=4.25
+zeroc-ice>=3.7,<3.8

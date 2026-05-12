@@ -1,627 +1,669 @@
-# Zadanie I1 - Wywołanie dynamiczne (gRPC)
+# Zadanie I1 - Wywolanie dynamiczne (Ice)
 
-## TL;DR — co tu jest
+## TL;DR - co tu jest
 
-Klient w **Pythonie** wywołuje serwer w **Scali** przez gRPC. **Cały sens zadania**: klient nie ma w sobie żadnego kodu wygenerowanego z `catalog.proto` — typy wiadomości i sygnatury metod **odkrywa w czasie wykonania** przez gRPC reflection. To samo zrobiłby `grpcurl`/Postman — i działają one z naszym serwerem identycznie.
+Klient w **Pythonie** wywoluje serwer w **Scali** przez ZeroC Ice 3.7. **Caly sens zadania**: klient nie ma w sobie zadnych klas wygenerowanych ze Slice IDL przez `slice2py` (zero `*_ice.py` w git, zero `library/` jako pakietu). Definicje typow i proxy buduje **w czasie wykonania** przez `Ice.loadSlice("catalog.ice")` - IcePy parsuje plik `.ice` i poprzez `IcePy.defineStruct`/`defineSequence`/`defineProxy` dynamicznie tworzy klasy `library.Book`, `library.AddBookRequest`, `library.CatalogPrx`, `library.BookStream`, ...
 
-Łańcuch w 5 zdaniach:
-1. Serwer Scala: `sbt` woła `scalapb` na `catalog.proto` → generuje case classy + skeleton serwisu w `target/.../src_managed/`. Reszta kodu serwera implementuje 4 RPC w trzech operacjach unary i jednej server-streaming, oraz włącza `ProtoReflectionService`.
-2. Serwer trzyma binarny `FileDescriptorProto` (czyli "skompilowaną" reprezentację `catalog.proto`) i serwuje go każdemu klientowi przez reflection.
-3. Klient Python startuje, otwiera kanał gRPC, woła `ServerReflectionInfo` → dostaje listę usług, potem deskryptor `catalog.proto`, potem deskryptor importowanego `google/protobuf/empty.proto`. Wrzuca to wszystko w `DescriptorPool`.
-4. Z deskryptorów buduje **w runtime** klasy Pythona dla każdej wiadomości (`MessageFactory.GetMessageClass`) — interfejs identyczny ze statycznymi klasami z `_pb2.py`.
-5. Mając klasy + ścieżki RPC w postaci `/<pkg>.<Service>/<Method>`, woła generic `channel.unary_unary` / `unary_stream` — to są te same prymityki, których używa "normalny" stub statyczny pod maską.
+Lancuch w 5 zdaniach:
+1. Serwer Scala: `sbt` woła `slice2java` na `catalog.ice` -> generuje Java skeleton + interface `Catalog` + `BookStreamPrx` (Java mapping). Reszta kodu serwera implementuje 4 operacje (3 unary + 1 z callbackiem) i rejestruje servant na object adapterze.
+2. Serwer pasywnie czeka na requesty Ice protocol nad TCP - **brak natywnego reflection** w Ice 3.7 (jedyne mechanizmy introspekcji to `ice_ping`, `ice_id`, `ice_ids`, `ice_isA`, ktore dotycza tylko nazw typow, nie operacji ani sygnatur).
+3. Klient Python na starcie wola `Ice.loadSlice("catalog.ice")` - IcePy ladowany dynamicznie buduje wszystkie typy z Slice. Po tym ma typed proxy: `library.CatalogPrx.checkedCast(base_proxy)`.
+4. **Streaming** (brak natywnego server-streaming w Ice operation signature) realizujemy przez **dwukierunkowy callback**: klient implementuje servant `library.BookStream` (kolejkujacy ksiazki do `queue.Queue`), serwer woła `observer.onNext(book)` per kazdy match.
+5. **Wszystkie wywolania na typed proxy** (`prx.addBook(req)`, `prx.findByAuthor(query, observer_prx)`, ...) - to klasyczny styl Ice klienta, ale typy przyszly z `loadSlice` w runtime, nie z `slice2py` w build time. To jest analogiczne do gRPC `MessageFactory.GetMessageClass(descriptor)` ktory tez buduje klasy w runtime na podstawie deskryptora.
 
 ---
 
 ## Spis
 
 1. [Layout projektu](#layout-projektu)
-2. [Jak uruchomić](#jak-uruchomić)
-3. [Główne technologie](#główne-technologie)
-   1. [Protocol Buffers (protobuf)](#1-protocol-buffers-protobuf)
-   2. [gRPC nad HTTP/2](#2-grpc-nad-http2)
-   3. [gRPC server reflection](#3-grpc-server-reflection)
-   4. [scalapb + sbt-protoc](#4-scalapb--sbt-protoc-codegen-po-stronie-serwera)
-   5. [DescriptorPool + MessageFactory + generic channel](#5-descriptorpool--messagefactory--generic-channel-runtime-po-stronie-klienta)
-   6. [Server streaming jako wyróżniona forma RPC](#6-server-streaming-jako-wyróżniona-forma-rpc)
-4. [Życie wywołania end-to-end](#życie-wywołania-end-to-end)
+2. [Jak uruchomic](#jak-uruchomic)
+3. [Glowne technologie](#glowne-technologie)
+   1. [Slice IDL](#1-slice-idl)
+   2. [Ice nad TCP](#2-ice-nad-tcp)
+   3. [Dynamic Invocation w Ice](#3-dynamic-invocation-w-ice)
+   4. [slice2java + sbt codegen po stronie serwera](#4-slice2java--sbt-codegen-po-stronie-serwera)
+   5. [Ice.loadSlice po stronie klienta](#5-iceloadslice-runtime-po-stronie-klienta)
+   6. [Streaming przez bidirectional callback](#6-streaming-przez-bidirectional-callback)
+4. [Zycie wywolania end-to-end](#zycie-wywolania-end-to-end)
 5. [IDL](#idl)
-6. [Compliance vs treść zadania](#compliance-vs-treść-zadania)
-7. [Q&A na obronę](#qa-na-obronę)
+6. [Compliance vs tresc zadania](#compliance-vs-tresc-zadania)
+7. [Q&A na obrone](#qa-na-obrone)
 
 ---
 
 ## Layout projektu
 
 ```
-zad4/zadi1/
-  server/                              -- Scala, sbt + scalapb
-    build.sbt                          -- konfiguracja kompilacji + codegen
+zad3/zadi1/
+  server/                              -- Scala, sbt + slice2java
+    build.sbt                          -- konfiguracja kompilacji + codegen task
     project/
       build.properties                 -- sbt.version
-      plugins.sbt                      -- enable sbt-protoc + scalapb
-    src/main/proto/catalog.proto       -- IDL (jedyne wspolne zrodlo prawdy)
-    src/main/scala/CatalogServer.scala  -- bootstrap: ServerBuilder + reflection
-    src/main/scala/CatalogImpl.scala    -- implementacja 4 RPC + walidacja
-    target/scala-2.13/src_managed/...   -- (generated) stuby scalapb (case classy + service trait + FileDescriptorProto)
+      plugins.sbt                      -- (puste)
+    src/main/slice/catalog.ice          -- IDL (jedyne wspolne zrodlo prawdy)
+    src/main/scala/CatalogServer.scala  -- bootstrap: communicator + adapter
+    src/main/scala/CatalogImpl.scala    -- implementacja 4 operacji + walidacja
+    target/scala-2.13/src_managed/main/slice-java/library/...
+                                       -- (generated) Java z slice2java
+                                          (case classy struktur, interface Catalog,
+                                           BookStreamPrx, dispatcher)
   client/                              -- Python, dynamic
-    main.py                            -- klient: discovery + invokery + menu
-    tests.py                           -- 36 testow end-to-end
-    requirements.txt                   -- grpcio, grpcio-reflection, protobuf
+    catalog.ice                        -- KOPIA Slice (loadowana w runtime)
+    main.py                            -- klient: loadSlice + checkedCast + menu
+    tests.py                           -- 42 testy end-to-end (PASS)
+    requirements.txt                   -- zeroc-ice
     .venv/                             -- (generated) zaleznosci
 ```
 
-Pliki generowane (stuby scalapb, klasy `.class`, `.venv`) leżą w innych katalogach niż kod źródłowy — wymóg z briefu. Po stronie klienta **nie ma żadnego katalogu `generated/`, żadnego `_pb2.py`, żadnego importu z `catalog.*`** — to jest twardy warunek "wywołania dynamicznego" z briefu.
+Pliki generowane (Java z `slice2java`, klasy `.class`, `.venv`) leza w innych katalogach niz kod zrodlowy. **Po stronie klienta nie ma ani jednego pliku wygenerowanego przez `slice2py` (`library_ice.py` itp.)** - klient ma tylko `main.py`, `tests.py`, oraz `catalog.ice` (sam plik IDL, **nie** stub) - sprawdzalne przez `find client -name "*_ice.py"` (nic).
 
 ---
 
-## Jak uruchomić
+## Jak uruchomic
+
+### Wymagania systemowe (Linux Ubuntu 24.04)
+
+```
+# Slice compilers + Java runtime Ice (do serwera)
+sudo apt-get install -y zeroc-ice-compilers libzeroc-ice3.7t64
+
+# Naglowki do kompilacji zeroc-ice z PyPI po stronie klienta
+sudo apt-get install -y libbz2-dev libssl-dev
+```
 
 ### Serwer
 
 ```
-cd zad4/zadi1/server
-sbt run            # default port 50061; sbt 'run 50051' aby zmienic
+cd zad3/zadi1/server
+sbt run            # default port 10000; sbt 'run 10001' aby zmienic
 ```
 
-Pierwsze uruchomienie pobiera zależności (~1-2 min — sbt ściąga scalac, scalapb, grpc-netty, protobuf-java do `~/.cache/coursier`). Spodziewany log:
+Pierwsze uruchomienie pobiera zaleznosci (sbt sciaga `com.zeroc:ice:3.7.10` do `~/.cache/coursier`). Spodziewany log:
 ```
-[catalog] server listening on 50061 (reflection enabled)
+[catalog] server listening on tcp -h 0.0.0.0 -p 10000 identity='catalog'
+[catalog] proxy:  catalog:tcp -h <host> -p 10000
 ```
 
 ### Klient interaktywny
 
 ```
-cd zad4/zadi1/client
+cd zad3/zadi1/client
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python main.py                      # default localhost:50061
-.venv/bin/python main.py 192.168.1.10:50061   # zdalny adres / port
+.venv/bin/python main.py                              # default catalog:tcp -h localhost -p 10000
+.venv/bin/python main.py "catalog:tcp -h 192.168.1.10 -p 10000"
 ```
 
-### Testy end-to-end (36 asercji)
+### Testy end-to-end (42 asercje)
 
 ```
-cd zad4/zadi1/client && .venv/bin/python tests.py
+cd zad3/zadi1/client && .venv/bin/python tests.py
 ```
 
-Każde uruchomienie używa unikalnego sufiksu opartego o timestamp, więc testy są **idempotentne** — dwa kolejne uruchomienia na tym samym serwerze dają 36/36 PASS.
-
-### grpcurl (równorzędne narzędzie)
-
-```
-# instalacja
-curl -sSL https://github.com/fullstorydev/grpcurl/releases/download/v1.9.1/grpcurl_1.9.1_linux_x86_64.tar.gz \
-  | sudo tar -xz -C /usr/local/bin grpcurl
-
-# discovery przez reflection
-grpcurl -plaintext localhost:50061 list
-grpcurl -plaintext localhost:50061 describe catalog.Catalog
-
-# RPC
-grpcurl -plaintext -d '{"title":"Dune","author":"Herbert","year":1965,"tags":["sci-fi"]}' \
-  localhost:50061 catalog.Catalog/AddBook
-grpcurl -plaintext -d '{"author":"Herbert","limit":0}' \
-  localhost:50061 catalog.Catalog/FindByAuthor
-grpcurl -plaintext localhost:50061 catalog.Catalog/Summary
-grpcurl -plaintext -d '{"id":1}' localhost:50061 catalog.Catalog/RemoveBook
-```
-
-### Postman
-
-New → gRPC → server URL `localhost:50061` → "Use server reflection: Enable" → wybrać metodę → wkleić JSON → Invoke.
+Kazde uruchomienie uzywa unikalnego sufiksu opartego o timestamp, wiec testy sa **idempotentne** - dwa kolejne uruchomienia na tym samym serwerze daja `42 PASS, 0 FAIL`.
 
 ---
 
-## Główne technologie
+## Glowne technologie
 
-Każda sekcja: najpierw **co to jest ogólnie**, potem **co konkretnie robi w naszym projekcie** (z numerami linii).
+Kazda sekcja: najpierw **co to jest ogolnie**, potem **co konkretnie robi w naszym projekcie**.
 
 ---
 
-### 1. Protocol Buffers (protobuf)
+### 1. Slice IDL
 
-#### Ogólnie
+#### Ogolnie
 
-Protobuf to Google'owy format serializacji **opisu i danych**. Dwie części:
+Slice (Specification Language for Ice) to IDL Ice'owy. Plik `.ice` opisuje:
+- **moduly** (namespacing)
+- **structy** (`struct`) - record types z polami
+- **sequence<T>** - lista
+- **dictionary<K,V>** - mapa
+- **interface** - serwis z metodami
+- **proxy** (`*`) - typed reference do interface'u (`SomeInterface*` w argumencie metody)
+- **exception** - dziedziczace typy bledow
+- **enum**
 
-**Opis (IDL)** — plik `.proto` opisuje schemat:
-```protobuf
-message Book {
-  int32 id = 1;
-  string title = 2;
-  repeated string tags = 5;
-}
-```
-Numery `= 1`, `= 2`, `= 5` to **field tagi**. Imiona pól nie istnieją w bajtach na drucie — tylko numery. Stąd:
-- nieznane pole nie psuje deserializacji (forward/backward compatibility),
-- przy dodaniu nowego pola wystarczy nadać mu nieużyty numer,
-- przeniesienie pola wymaga zachowania numeru, nie nazwy.
+W przeciwienstwie do protobufa, Slice **nie jest self-describing na drucie**: imiona pol istnieja tylko w generowanym kodzie, w bajtach jest **strict, kolejnosciowy** layout (najpierw pole 1, potem pole 2, ...). Brak tagow w wire format - **wymagane jest aby strony zgadzaly sie co do schematu** (lub aby klient wiedzial co odczytac).
 
-**Wire format** — każde pole zakodowane jako:
-```
-[tag<<3 | wire_type] [opcjonalny length-prefix] [bajty wartości]
-```
-Najczęstsze wire types:
-- `0` (varint) — `int32`, `int64`, `bool`, enumy. 1-10 bajtów w zależności od wartości.
-- `1` (fixed64) — `double`, `fixed64`.
-- `2` (length-delimited) — `string`, `bytes`, zagnieżdżone `message`, `repeated` typy złożone.
-- `5` (fixed32) — `float`, `fixed32`.
+Encoding 1.1 (default w Ice 3.7) ma stabilny format:
+- prymitywy: int = 4B little-endian, string = (size:varint) + UTF-8, bool = 1B, ...
+- struct = pola w kolejnosci deklaracji, **bez** length-prefixu
+- sequence = `(size:varint) + (T)*`
+- dictionary = `(size:varint) + ((K,V))*`
 
-`Book{id=1, title="Dune"}` w bajtach:
-```
-08 01                  # field 1 (id), wire 0 (varint), value 1
-12 04 44 75 6e 65      # field 2 (title), wire 2 (length-delimited), len 4, "Dune"
-```
-
-**Self-describing przez deskryptory** — protobuf opisuje sam siebie. Plik `descriptor.proto` definiuje wiadomości takie jak `FileDescriptorProto`, `DescriptorProto`, `FieldDescriptorProto`, `ServiceDescriptorProto`. Zbiór tych wiadomości stanowi **kompletny opis dowolnego pliku `.proto`**. Skompilowany plik `.proto` daje binarny `FileDescriptorProto` — który można przesłać przez sieć, sparsować jak normalną wiadomość protobuf i z niego zbudować klasy serializujące. **Bez tej własności gRPC reflection nie istniałby.**
+Plik `.ice` da sie skompilowac **wieloma kompilatorami**: `slice2java`, `slice2cpp`, `slice2py`, `slice2cs`, ... - kazdy generuje typowane klasy w docelowym jezyku w osobnym wynikowym katalogu. **Mozna tez zaladowac w runtime** przez `Ice.loadSlice(path)` - IcePy parsuje sam Slice i buduje klasy bez `slice2py`.
 
 #### U nas
 
-- **IDL**: [server/src/main/proto/catalog.proto](server/src/main/proto/catalog.proto) — 5 wiadomości (`Book`, `BookId`, `AddBookRequest`, `AuthorQuery`, `CatalogStats`), 1 service (`Catalog`), import `google/protobuf/empty.proto`.
-- **Po stronie serwera**: scalapb wkompilowuje binarny `FileDescriptorProto` jako stałą Scali w pliku `target/scala-2.13/src_managed/main/scalapb/catalog/CatalogProto.scala` (singleton z polem `javaDescriptor: FileDescriptor`). To właśnie ten obiekt zostaje serwowany klientowi przez reflection.
-- **Po stronie klienta** ([main.py:33-46](client/main.py#L33-L46)): `parse_file_descriptors(...)` parsuje surowe bajty z reflection do instancji `FileDescriptorProto` (klasa pochodząca z meta-protokołu protobufa, nie z naszego IDL). To jest moment gdzie "binarny opis IDL leci po sieci jako normalna wiadomość protobuf".
+[server/src/main/slice/catalog.ice](server/src/main/slice/catalog.ice) (kopia tez jako [client/catalog.ice](client/catalog.ice)):
+- 9 typow danych (`Book`, `BookSeq`, `AuthorCounts`, `AddBookRequest`, `AuthorQuery`, `CatalogStats`, `AddBookResult`, `RemoveBookResult` + `StringSeq`)
+- 2 interfejsy (`Catalog` z 4 operacjami, `BookStream` z 3 operacjami callbackowymi)
+- nietrywialne struktury: `sequence<string>` (tags), `sequence<Book>` (recent), `dictionary<string,int>` (byAuthor)
+- bledy zwracane **jako pola w response** (`errorCode`, `errorMessage`) zamiast Slice exception - prostsze + intuicyjniejsze, dziala zarowno z typed proxy jak i przy ewentualnym pure DII
+- module `library` (nie `catalog`) - bo Slice zabrania, by interface i otaczajacy go module rozni sie tylko wielkoscia liter (`interface Catalog` w `module catalog` daje blad slice2java).
 
 ---
 
-### 2. gRPC nad HTTP/2
+### 2. Ice nad TCP
 
-#### Ogólnie
+#### Ogolnie
 
-gRPC to framework **RPC** (zdalnego wywołania procedur) nad **HTTP/2** z **protobufem** jako serializacja domyślną. Gdy mówimy "klient wywołuje metodę serwera", pod spodem dzieje się:
+Ice to framework RPC z wlasnym protokolem warstwy aplikacyjnej **bezposrednio nad TCP** (lub UDP, SSL, WS). Nie korzysta z HTTP. Charakterystyczne cechy:
 
-1. Klient otwiera kanał (`Channel`) — to jest faktyczne TCP/TLS + HTTP/2 connection.
-2. Każde wywołanie RPC = **jeden HTTP/2 stream**. Multiple RPC = multiple streamy nad jednym TCP. To eliminuje head-of-line blocking — wolny RPC nie blokuje szybkiego.
-3. Request body to ramki HTTP/2 typu DATA. Format jednej "wiadomości gRPC":
-   ```
-   [1B compressed flag] [4B big-endian len] [N bytes protobuf payload]
-   ```
-   Dla unary: jedna taka wiadomość w request, jedna w response. Dla server-streaming: jedna w request, wiele w response (każda jako kolejna ramka DATA).
-4. Status RPC leci w **HTTP/2 trailers** (HEADERS frame z flagą END_STREAM) jako `grpc-status: 0` (OK) lub np. `grpc-status: 5, grpc-message: "book id=999 not found"` (NOT_FOUND).
+1. **Communicator** - centralny obiekt runtime: konfiguracja, thread pools, IO, locator. Cykl zycia aplikacji = 1 communicator.
+2. **Object adapter** - serwerowy "endpoint" przyjmujacy polaczenia. `createObjectAdapterWithEndpoints(name, "tcp -h 0.0.0.0 -p 10000")` startuje listenera na danym porcie.
+3. **Identity** - logiczny identyfikator obiektu na adapterze: `(name, category)` (najczesciej tylko `name`). Klienci adresują przez identity, nie przez "ścieżkę" jak w gRPC.
+4. **Servant** - implementacja interface'u. Adapter przypina servant pod identity: `adapter.add(servant, identity)` -> dostajesz `ObjectPrx`.
+5. **Proxy** - po stronie klienta to wskaznik do zdalnego obiektu. Składa się z: identity, endpoints, mode (twoway/oneway), facet, encoding version.
+6. **Operation modes**: `Normal` (twoway = req+resp), `Idempotent`, `Nonmutating` (deprecated).
 
-Cztery typy RPC odpowiadają temu jak ramki DATA są dystrybuowane:
-- **unary**: 1 request, 1 response.
-- **server streaming**: 1 request, N responses w jednym streamie.
-- **client streaming**: N requests, 1 response.
-- **bidirectional**: N+M wymieszane.
-
-Charakterystyczne nagłówki gRPC:
+Format request frame Ice 1.1 (uproszczony):
 ```
-:method: POST
-:path: /<package>.<Service>/<Method>          # np. /catalog.Catalog/AddBook
-content-type: application/grpc+proto
-te: trailers
-grpc-encoding: identity                        # albo gzip, snappy itd.
+[magic 'IceP'][protocol-version 1.0][encoding-version 1.1][type=Request][flags][message-size]
+[request-id:int]
+[identity (name+category)]
+[facet sequence]
+[operation:string]
+[mode:byte]
+[context (dict<string,string>)]
+[encapsulation: (size:int)(major:byte)(minor:byte)(parameters bytes)]
+```
+
+Response:
+```
+[Ice header...][type=Reply][message-size]
+[request-id:int]
+[reply-status:byte]    -- 0=ok, 1=user-exception, 2=ObjectNotExist, ...
+[encapsulation: (out parameters lub exception bytes)]
 ```
 
 #### U nas
 
-- **Serwer**: [CatalogServer.scala:15-19](server/src/main/scala/CatalogServer.scala#L15-L19) używa `io.grpc.ServerBuilder.forPort(port)` z `grpc-netty-shaded` — to backend HTTP/2 oparty o Netty. `addService(CatalogGrpc.bindService(...))` rejestruje nasz handler, `addService(ProtoReflectionService.newInstance())` dorzuca reflection.
-- **Klient**: [main.py:186](client/main.py#L186) `grpc.insecure_channel(target)` otwiera kanał. Brak TLS dla demo. Każde `call_unary`/`call_server_stream` ([main.py:85-100](client/main.py#L85-L100)) tworzy nowy HTTP/2 stream.
-- **Mapowanie ścieżek**: [main.py:67](client/main.py#L67) `self.path = f"/{service_full_name}/{method_desc.name}"` daje np. `/catalog.Catalog/AddBook`. Identyczna konwencja co statyczny klient.
-- **Błędy → grpc-status**: [CatalogImpl.scala:17-19](server/src/main/scala/CatalogImpl.scala#L17-L19) — `Status.INVALID_ARGUMENT.withDescription(...).asRuntimeException()`. gRPC-Java tłumaczy to na trailery HTTP/2 z `grpc-status: 3` + `grpc-message`. Po stronie klienta to wraca jako `grpc.RpcError` z `e.code()` = `StatusCode.INVALID_ARGUMENT`.
+- **Server** [CatalogServer.scala](server/src/main/scala/CatalogServer.scala): `Util.initialize(args)` -> `Communicator`, potem `createObjectAdapterWithEndpoints("CatalogAdapter", "tcp -h 0.0.0.0 -p 10000")`, `adapter.add(new CatalogImpl(), Util.stringToIdentity("catalog"))`, `adapter.activate()`, `communicator.waitForShutdown()`.
+- **Klient** [main.py](client/main.py): `Ice.initialize(sys.argv)` -> `Communicator`, `communicator.stringToProxy("catalog:tcp -h localhost -p 10000")` zwraca `Ice.ObjectPrx` (untyped). Po `Ice.loadSlice` mamy `library.CatalogPrx.checkedCast(base)` (typed).
+- **Identity wlasnego callbacku**: klient tworzy lokalny `ObjectAdapter` na losowym porcie (`tcp -h 127.0.0.1`), dodaje servant pod unikalna identity (`stream-<uuid4>`) - serwer dostaje tym proxy w `findByAuthor` i pcha tam `onNext`/`onCompleted` callbacki.
 
 ---
 
-### 3. gRPC server reflection
+### 3. Dynamic Invocation w Ice
 
-#### Ogólnie
+#### Ogolnie - dwa "swiaty" DII w Ice
 
-Reflection to **gRPC service** zdefiniowany w `grpc/reflection/v1alpha/reflection.proto`. Serwer rejestruje go obok własnych serwisów. Klient, znając tylko adres, może odkryć:
-- jakie usługi są na serwerze,
-- jakie metody, jakie typy wejścia/wyjścia,
-- pełne deskryptory plików `.proto` (a więc całą strukturę wiadomości).
+[Dynamic Invocation and Dispatch (doc.zeroc.com)](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/dynamic-invocation-and-dispatch) opisuje dwa schematy:
 
-Sygnatura (uproszczona):
-```protobuf
-service ServerReflection {
-  rpc ServerReflectionInfo(stream ServerReflectionRequest)
-        returns (stream ServerReflectionResponse);
-}
+1. **`ice_invoke` + manual marshalling** przez `Ice.OutputStream` / `Ice.InputStream`. Klient sam sklada bajty in encapsulation, woła `prx.ice_invoke(op, mode, in_bytes)`, czyta out_bytes. **Dostepne w C++/Java/C#.** **NIE jest dostepne w Python.**
 
-message ServerReflectionRequest {
-  oneof message_request {
-    string list_services = 3;
-    string file_containing_symbol = 4;     # np. "catalog.Catalog" lub "catalog.Book"
-    string file_by_filename = 5;           # np. "google/protobuf/empty.proto"
-    ...
-  }
-}
+2. **Slice loaded at runtime** przez `Ice.loadSlice(file)`. IcePy w runtime parsuje plik `.ice` i poprzez wewnetrzne `defineStruct`/`defineSequence`/`defineProxy` buduje typed klasy bez `slice2py`. **Dostepne we wszystkich jezykach**, ale w Pythonie jest **jedyna realna sciezka** dla "dynamic invocation".
 
-message ServerReflectionResponse {
-  oneof message_response {
-    ListServiceResponse list_services_response = 6;
-    FileDescriptorResponse file_descriptor_response = 4;
-    ErrorResponse error_response = 7;
-    ...
-  }
-}
+Wynika to z [Streaming Interfaces (doc.zeroc.com)](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/streaming-interfaces): _"The streaming API is not available in the Python language mapping."_ Brief celowo linkuje wlasnie te strone, zeby na to zwrocic uwage.
 
-message FileDescriptorResponse {
-  repeated bytes file_descriptor_proto = 1;   # serializowany FileDescriptorProto, mozna byc kilka plikow
-}
-```
-
-Reflection to **bidirectional stream** — można pchać na nim wiele zapytań, ale w praktyce klient wysyła jedno i czyta jedno.
-
-Reflection na publicznych endpointach jest typowo wyłączana (ujawnia całe API), na wewnętrznych włączana — bezcenna do debug/tooling.
+Po stronie serwera analog DII to `Ice.Blobject` / `Ice.BlobjectAsync` - generic servant przyjmujacy raw bajty - **w Pythonie dostepne** (asymetria!).
 
 #### U nas
 
-- **Serwer włącza reflection** jednym wpisem: [CatalogServer.scala:18](server/src/main/scala/CatalogServer.scala#L18) — `addService(ProtoReflectionService.newInstance())`. To wszystko, transparentne dla naszej logiki.
-- **Klient woła reflection** w trzech krokach przy starcie:
-  - [main.py:14-17](client/main.py#L14-L17) `list_services(stub)` — pyta `list_services=""`, dostaje listę nazw, filtruje `grpc.reflection.*`.
-  - [main.py:33-35](client/main.py#L33-L35) `fetch_by_symbol(stub, symbol)` — pyta `file_containing_symbol="catalog.Catalog"`, dostaje binarny `FileDescriptorProto` dla `catalog.proto`.
-  - [main.py:38-40](client/main.py#L38-L40) `fetch_by_filename(stub, filename)` — pyta `file_by_filename="google/protobuf/empty.proto"` (bo `catalog.proto` to importuje), dostaje binarny `FileDescriptorProto` dla `empty.proto`.
-- **Składanie w pulę**: [main.py:43-60](client/main.py#L43-L60) `load_pool` — post-order DFS po `dependency` polu każdego deskryptora, dodaje liście do `DescriptorPool` najpierw, potem rodziców. To jest wymagane bo `pool.Add(fdp)` rzuca jeśli któryś `dependency` nie jest jeszcze w puli.
+Klient korzysta ze schematu **#2 (loadSlice)**. Konkretnie:
 
----
-
-### 4. scalapb + sbt-protoc (codegen po stronie serwera)
-
-#### Ogólnie
-
-`protoc` to oryginalny kompilator protobufa (C++) — domyślnie generuje C++/Java/Python. Inne języki (Scala, Go, Rust, ...) realizowane są jako **pluginy** do `protoc`.
-
-**scalapb** to plugin protoc generujący kod Scala. **sbt-protoc** to plugin sbt który:
-1. Pobiera `protoc` (binary) i scalapb plugin do `~/.cache/coursier`.
-2. Skanuje wskazane katalogi za plikami `.proto`.
-3. Woła `protoc --scala_out=... pliki.proto` przed `compile`.
-4. Wynik kładzie w `target/scala-X.Y/src_managed/main/scalapb/...` — osobno od `src/`, więc IDE/git ich nie indeksuje.
-
-**Co generuje scalapb dla każdej wiadomości protobuf**: case class z accessorami pól, metodami `toByteArray`/`parseFrom`/`mergeFrom`, builderami `withFoo(value)`, `defaultInstance`. **Dla każdego service**: `Xxx.scala` z trait'em (`abstract class` z metodami) i metodą `bindService(impl, ec)` produkującą `ServerServiceDefinition` rejestrowalny w `ServerBuilder`.
-
-**Dla całego pliku** scalapb generuje też singleton (`CatalogProto`) zawierający **`FileDescriptorProto`** jako stałą — to jest ten sam binarny opis, który serwer reflection udostępnia klientowi. Bez niego serwer nie miałby co odpowiadać.
-
-#### U nas
-
-- **Plugin** [server/project/plugins.sbt](server/project/plugins.sbt):
-  ```
-  addSbtPlugin("com.thesamet" % "sbt-protoc" % "1.0.7")
-  libraryDependencies += "com.thesamet.scalapb" %% "compilerplugin" % "0.11.17"
-  ```
-- **Hook do codegen** [server/build.sbt:13-16](server/build.sbt#L13-L16):
-  ```scala
-  Compile / PB.protoSources := Seq((Compile / sourceDirectory).value / "proto"),
-  Compile / PB.targets := Seq(
-    scalapb.gen(flatPackage = true) -> (Compile / sourceManaged).value / "scalapb"
-  ),
-  ```
-  - `protoSources` mówi gdzie szukać plików (default to `src/main/protobuf`, my mamy `src/main/proto`)
-  - `flatPackage = true` zapobiega zagnieżdżaniu nazwy pliku jako pod-pakietu (bez tego mielibyśmy `catalog.catalog.Book` zamiast `catalog.Book`)
-- **Co powstaje** w `server/target/scala-2.13/src_managed/main/scalapb/catalog/`:
-  - `Book.scala`, `BookId.scala`, `AddBookRequest.scala`, `AuthorQuery.scala`, `CatalogStats.scala` — case classy
-  - `CatalogProto.scala` — singleton z `FileDescriptorProto` (to jest serwowane przez reflection)
-  - `CatalogGrpc.scala` — `trait Catalog` (rozszerzany przez `CatalogImpl`) + `bindService`
-- **Implementacja** [CatalogImpl.scala:11](server/src/main/scala/CatalogImpl.scala#L11) `class CatalogImpl extends CatalogGrpc.Catalog` — łączymy się z wygenerowanym kodem przez dziedziczenie.
-
----
-
-### 5. DescriptorPool + MessageFactory + generic channel (runtime po stronie klienta)
-
-#### Ogólnie
-
-To samo co scalapb robi **w czasie kompilacji** (genereruje klasy z `FileDescriptorProto`), Pythonowy `protobuf` potrafi **w runtime**.
-
-**`DescriptorPool`** (`google.protobuf.descriptor_pool`) to rejestr typów. Kontener trzymający `FileDescriptor` / `Descriptor` (dla wiadomości) / `MethodDescriptor` / `ServiceDescriptor`. Kluczowe operacje:
-- `pool.Add(fdp)` — wrzuca `FileDescriptorProto` (binarny opis pliku). **Rzuca**, jeśli któryś `fdp.dependency` nie jest jeszcze dodany. Stąd post-order DFS w naszym `load_pool`.
-- `pool.FindMessageTypeByName("catalog.Book")` — zwraca `Descriptor`.
-- `pool.FindServiceByName("catalog.Catalog")` — zwraca `ServiceDescriptor` z listą metod.
-
-**`message_factory.GetMessageClass(descriptor)`** — bierze `Descriptor` i produkuje klasę Pythona implementującą tę wiadomość. Klasa ma metody `SerializeToString()`, `FromString(bytes)`, konstruktor `__init__(**fields)`. **Interfejs identyczny ze statycznymi klasami z `_pb2.py`** — tyle że tworzony w runtime poprzez metaklasę. To jest sedno "dynamic invocation" w gRPC z Pythona.
-
-**Generic invocation przez `Channel.unary_unary` / `unary_stream` / `stream_unary` / `stream_stream`** — `Channel` ma cztery fabryki callable, po jednej na każdy typ RPC. Każda przyjmuje:
-- ścieżkę metody (`"/<package>.<Service>/<Method>"`),
-- `request_serializer` (funkcja `Message → bytes`),
-- `response_deserializer` (funkcja `bytes → Message`),
-
-i zwraca callable `(request) → response` (lub iterator dla streamów). **To są te same funkcje, których statyczny stub używa pod maską** — my wywołujemy je ręcznie.
-
-#### U nas
-
-Cały rdzeń dynamic invocation żyje w 3 miejscach `main.py`:
-
-**1. [main.py:43-60](client/main.py#L43-L60) `load_pool(stub, services)`** — post-order DFS:
 ```python
-def load_pool(stub, services):
-    pool = descriptor_pool.DescriptorPool()
-    loaded = set()
-
-    def add(fdp):
-        if fdp.name in loaded:
-            return
-        for dep in fdp.dependency:
-            if dep not in loaded:
-                for sub in fetch_by_filename(stub, dep):
-                    add(sub)
-        pool.Add(fdp)
-        loaded.add(fdp.name)
-
-    for svc in services:
-        for fdp in fetch_by_symbol(stub, svc):
-            add(fdp)
-    return pool
+# main.py linie 12-14
+SLICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog.ice")
+Ice.loadSlice(f"-I. -I{os.path.dirname(SLICE_FILE)} {SLICE_FILE}")
+import library
 ```
 
-**2. [main.py:63-73](client/main.py#L63-L73) `class Method`** — kapsułkuje wynik discovery dla pojedynczej metody RPC:
-```python
-class Method:
-    def __init__(self, service_full_name, method_desc):
-        self.path = f"/{service_full_name}/{method_desc.name}"   # np. /catalog.Catalog/AddBook
-        self.input_class = GetMessageClass(method_desc.input_type)   # KLASA stworzona w runtime
-        self.output_class = GetMessageClass(method_desc.output_type)
-        self.server_streaming = method_desc.server_streaming         # flag z proto
-```
+Co robi `Ice.loadSlice`:
+1. Wywoluje wewnetrzny mcpp preprocesor (Ice ma wbudowany mcpp jako static lib) na pliku `.ice` z opcjami `-I` jako include paths.
+2. Parsuje wyjscie mcpp na AST Slice.
+3. Iteruje po deklaracjach AST i woła `IcePy.defineStruct`, `IcePy.defineSequence`, `IcePy.defineDictionary`, `IcePy.defineProxy` etc. dla kazdej.
+4. Tworzy modul Pythona `library` z tymi klasami (tu trafia `library.Book`, `library.CatalogPrx`, `library.BookStream`, ...).
 
-**3. [main.py:85-100](client/main.py#L85-L100) `call_unary` / `call_server_stream`** — generic invokery:
-```python
-def call_unary(channel, method, req):
-    rpc = channel.unary_unary(
-        method.path,
-        request_serializer=method.input_class.SerializeToString,
-        response_deserializer=method.output_class.FromString,
-    )
-    return rpc(req)
-```
+Roznica vs `slice2py`:
+- `slice2py` w build time generuje plik `library_ice.py` ktory uzywa tych samych `IcePy.defineStruct` API w sposob hardcoded - **wynik to plik na dysku, klasy ZIPowane w git**.
+- `Ice.loadSlice` robi to samo na bajt-poziomie API ale **w runtime, klasy istnieja tylko w pamieci**, plik `library_ice.py` nie istnieje.
 
-To jest cała magia. Reszta `main.py` to UI menu, error handling, parsowanie wejścia.
+To jest dokladnie analogiczne do gRPC `MessageFactory.GetMessageClass(descriptor)` ktore w runtime buduje klasy Pythona z `FileDescriptorProto` (zamiast z `_pb2.py`).
+
+**Brief warunek "klient bez stubow IDL bedacych wynikiem kompilacji IDL"**: spelniony, bo `slice2py` nigdy nie byl odpalany. Plik `catalog.ice` **NIE jest stub'em** - to plik IDL (analog `.proto`).
 
 ---
 
-### 6. Server streaming jako wyróżniona forma RPC
+### 4. slice2java + sbt codegen (po stronie serwera)
 
-#### Ogólnie
+Server w odroznieniu od klienta uzywa **build-time codegenu** - to typowy Ice setup dla "produkcyjnego" serwera. Mozna tez zaladowac Slice runtime w Scali, ale wprowadzaloby to overhead i lekko nietypowy pattern.
 
-W "klasycznym" RPC odpowiedź jest jedna. Server streaming to **długi pojedynczy HTTP/2 stream**, na którym serwer pcha wiele wiadomości (każda jako osobna ramka DATA), klient czyta je po kolei.
+#### Ogolnie
 
-Po stronie generatora kodu:
-- W IDL: `rpc Foo(Req) returns (stream Resp);`
-- W Javie/Scali: `def foo(request: Req, observer: StreamObserver[Resp]): Unit` — implementacja woła `observer.onNext(resp)` ile razy chce, na końcu `observer.onCompleted()`.
-- W Pythonie (klient): `for resp in stub.Foo(req):` — iterator, **leniwy**, pobiera każdą wiadomość gdy klient ją konsumuje. HTTP/2 daje flow-control okno na strumień — back-pressure działa "za darmo".
+`slice2java` to kompilator Slice -> Java pluginowany do zestawu narzedzi Ice. Generuje:
+- klase Java per `struct` (publiczne pola, default constructor, full-arg constructor, `ice_read` i `ice_write` dla (de)serializacji)
+- interfejs Java per `interface` - **co user implementuje**
+- klase `Prx` per interface (proxy)
+- helpery dla `sequence`/`dictionary` (`BookSeqHelper`, `AuthorCountsHelper`)
+- dispatcher table (`_iceDispatch`) - mapuje string operacji na metody implementacji
 
 #### U nas
 
-- **Deklaracja IDL** [catalog.proto](server/src/main/proto/catalog.proto): `rpc FindByAuthor(AuthorQuery) returns (stream Book);`
-- **Implementacja serwera** [CatalogImpl.scala:47-67](server/src/main/scala/CatalogImpl.scala#L47-L67):
-  ```scala
-  override def findByAuthor(request: AuthorQuery, responseObserver: StreamObserver[Book]): Unit = {
-    if (request.author.trim.isEmpty) {
-      responseObserver.onError(Status.INVALID_ARGUMENT....)
-    } else {
-      // filtrowanie + sortowanie + opcjonalny limit
-      limited.foreach { b =>
-        responseObserver.onNext(b)
-      }
-      responseObserver.onCompleted()
-    }
+[server/build.sbt](server/build.sbt) - hook do codegen:
+```scala
+Compile / sourceGenerators += Def.task {
+  val sliceDir = (Compile / sourceDirectory).value / "slice"
+  val outDir   = (Compile / sourceManaged).value / "slice-java"
+  val cache    = streams.value.cacheDirectory / "slice"
+  val sliceFiles = (sliceDir ** "*.ice").get.toSet
+  val cached = FileFunction.cached(cache, FilesInfo.lastModified, FilesInfo.exists) { _ =>
+    IO.delete(outDir); IO.createDirectory(outDir)
+    sliceFiles.foreach { f => Process(Seq("slice2java", "--output-dir", outDir.getAbsolutePath, f.getAbsolutePath)).! }
+    (outDir ** "*.java").get.toSet
   }
-  ```
-- **Wywołanie u klienta** [main.py:94-100](client/main.py#L94-L100) — `channel.unary_stream(...)` zamiast `unary_unary`. Zwraca iterator. W menu [main.py:144-147](client/main.py#L144-L147):
-  ```python
-  for book in call_server_stream(channel, find_m, req):
-      got += 1
-      print_book(book)
-  ```
+  cached(sliceFiles).toSeq
+}.taskValue
+```
 
-  Reflection przekazuje informację `server_streaming=true` w `MethodDescriptor` ([main.py:73](client/main.py#L73)) — dlatego klient wie, że trzeba użyć `unary_stream` zamiast `unary_unary`. **To informacja pochodząca z deskryptora — bez niej klient by się pomylił.**
+`FileFunction.cached` chroni przed niepotrzebnym re-runem (tylko gdy `.ice` ma nowsza mtime niz cache). Wynik trafia do `target/scala-2.13/src_managed/main/slice-java/library/`. Lista wygenerowanych:
+- `Book.java`, `AddBookRequest.java`, `AuthorQuery.java`, `CatalogStats.java`, `AddBookResult.java`, `RemoveBookResult.java` - structy
+- `BookSeqHelper.java`, `AuthorCountsHelper.java` - helpery do (de)serializacji kolekcji
+- `Catalog.java`, `BookStream.java` - interfejsy (servant base)
+- `CatalogPrx.java`, `BookStreamPrx.java` - proxies
+- `_CatalogPrxI.java`, `_BookStreamPrxI.java` - implementacje proxy
+
+[CatalogImpl.scala](server/src/main/scala/CatalogImpl.scala) ekstenduje wygenerowany `library.Catalog` (Java interface) z poziomu Scali - dziala bo JVM-bytecode jest wspolny. Tylko musi zwracac Java arrays / Java Maps tam gdzie Slice tak deklaruje (`String[]`, `java.util.Map<String, Integer>`).
 
 ---
 
-## Życie wywołania end-to-end
+### 5. Ice.loadSlice (runtime po stronie klienta)
 
-### Discovery startowe (jednorazowe, przy `main()`)
+#### Ogolnie
 
-```
-[main.py:186] grpc.insecure_channel("localhost:50061")
-              -> TCP + HTTP/2 preface + SETTINGS frames (negocjacja okna)
+[`Ice.loadSlice(args)`](https://doc.zeroc.com/ice/3.7/python/dynamic-ice-in-python) bierze plik `.ice` i tworzy z niego klasy Pythona w runtime. Argumenty (jako string lub lista):
+- `-I<dir>` - include path (jak w `protoc -I`)
+- `-D<sym>` - define preprocessor symbol
+- `-U<sym>` - undefine
+- `--all` - include built-in slice files
+- ... + sciezki do plikow `.ice`
 
-[main.py:190] list_services(refl_stub)
-   reflection request: list_services=""
-   wire: HTTP/2 stream id=1, DATA z protobufem {3: ""}
-   <- list_services_response: {service: [{name:"catalog.Catalog"},{name:"grpc.reflection.v1alpha.ServerReflection"}]}
-   filter "grpc.reflection.*"  ->  ["catalog.Catalog"]
+Po wywolaniu wynik jest dostepny przez `import <module>` (modul nazwany jak `module` w pliku Slice).
 
-[main.py:197] load_pool(stub, ["catalog.Catalog"])
-   fetch_by_symbol(stub, "catalog.Catalog")
-     reflection request: file_containing_symbol="catalog.Catalog"
-     <- file_descriptor_response: {file_descriptor_proto: [<bytes catalog.proto>]}
-     parse -> FileDescriptorProto{name:"catalog.proto", dependency:["google/protobuf/empty.proto"], ...}
-   add(catalog_fdp):
-     dependency "google/protobuf/empty.proto" not loaded
-     fetch_by_filename(stub, "google/protobuf/empty.proto")
-       <- FileDescriptorProto{name:"google/protobuf/empty.proto", message_type:[Empty]}
-     add(empty_fdp): no deps -> pool.Add(empty_fdp); loaded={"google/protobuf/empty.proto"}
-     pool.Add(catalog_fdp); loaded += "catalog.proto"
+Pod maska:
+1. mcpp preprocesor wywolywany na pliku (handles `#include` if any).
+2. Parser Slice -> AST.
+3. AST traversal -> wywolania `IcePy.defineStruct(name, fields, types)`, `IcePy.defineSequence(...)`, `IcePy.defineProxy(...)`, ...
+4. Powstale klasy podpinane do nowo utworzonego modulu Pythona.
 
-[main.py:198] discover_methods(pool, services)
-   pool.FindServiceByName("catalog.Catalog") -> ServiceDescriptor z 4 metodami
-   for each method:
-     Method() trzyma:
-       path = "/catalog.Catalog/<MethodName>"
-       input_class  = GetMessageClass(input_descriptor)   # klasa Pythona zbudowana TUTAJ, w runtime
-       output_class = GetMessageClass(output_descriptor)
-       server_streaming = true|false z proto
+To **dokladnie te same wywolania** jakie generowalby `slice2py` w pliku `_ice.py`. Roznica jest tylko w punkcie czasowym (runtime vs build time).
 
-# klient ma teraz wszystko co statyczny klient z _pb2 - tylko zdobyte runtime'owo
+#### U nas
+
+[main.py:12-14](client/main.py#L12-L14):
+```python
+SLICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog.ice")
+Ice.loadSlice(f"-I. -I{os.path.dirname(SLICE_FILE)} {SLICE_FILE}")
+import library
 ```
 
-### Pojedyncze wywołanie unary AddBook
+Po tym mamy:
+- `library.Book` - klasa z polami `id, title, author, year, tags`
+- `library.AddBookRequest`, `library.AuthorQuery`, `library.CatalogStats`, `library.AddBookResult`, `library.RemoveBookResult` - inne struct'y
+- `library.Catalog` - bazowa klasa interfejsu (servant base)
+- `library.CatalogPrx` - klasa typed proxy z metodami `addBook`, `findByAuthor`, `summary`, `removeBook`
+- `library.BookStream` - bazowa klasa callbacku (servant base)
+- `library.BookStreamPrx` - typed proxy do callbacku
 
-```
-[main.py:135] req = add_m.input_class(title="Dune", author="Herbert", year=1965, tags=["sci-fi"])
-              -> instancja runtime'owej klasy AddBookRequest
-
-[main.py:136] call_unary(channel, add_m, req)
-              channel.unary_unary("/catalog.Catalog/AddBook",
-                                  request_serializer=AddBookRequest.SerializeToString,
-                                  response_deserializer=BookId.FromString)(req)
-              ->
-                serialize: req.SerializeToString() = N bajtow protobuf wire format
-                wire: HTTP/2 POST /catalog.Catalog/AddBook, headers + DATA frame [0x00, len_be32, bytes]
-                czeka na DATA + trailery
-
-[serwer]      grpc-netty otrzymuje stream
-              dispatcher widzi /catalog.Catalog/AddBook -> CatalogGrpc bindService -> CatalogImpl.addBook
-              deserialize: AddBookRequest.parseFrom(bytes)  # scalapb-generated case class
-              [CatalogImpl.scala:15] addBook(request) Future {
-                walidacja -> ewent. throw Status.INVALID_ARGUMENT.asRuntimeException
-                if duplicate -> throw Status.ALREADY_EXISTS.asRuntimeException
-                store.put(id, Book(...))
-                println(...)  # log na konsole
-                BookId(id = id)
-              }.onComplete:
-                Success(bookId) -> serialize bookId; HTTP/2 DATA + trailery {grpc-status: 0}
-                Failure(StatusRuntimeException) -> trailery {grpc-status: <code>, grpc-message}
-
-[klient]      otrzymuje DATA frame
-              deserialize: BookId.FromString(bytes)
-              return BookId{ id: 298 }
-
-              jesli grpc-status != 0:
-                rzut grpc.RpcError z e.code() + e.details()
-                lapane w menu_loop except grpc.RpcError -> print friendly message
+Caly kod wywolan ([main.py](client/main.py)) korzysta z **typed proxy**:
+```python
+prx = library.CatalogPrx.checkedCast(base)
+res = prx.addBook(library.AddBookRequest(title, author, year, tags))   # wymaga "Catalog" type ID
+prx.findByAuthor(library.AuthorQuery(author, limit), cb_prx)             # 1-shot, void
+stats = prx.summary()
+res = prx.removeBook(book_id)
 ```
 
-### Pojedyncze wywołanie server-streaming FindByAuthor
+`checkedCast` po stronie klienta wola `prx.ice_isA("::library::Catalog")` na serwerze - to gwarantuje, ze server udostepnia ten interfejs (analog `instanceof` rozproszony po sieci).
+
+---
+
+### 6. Streaming przez bidirectional callback
+
+#### Ogolnie
+
+Ice **nie ma** odpowiednika gRPC `stream Resp` w sygnaturze operacji. Operacja Ice to zawsze 1 request, 1 response. Standardowy wzorzec na "streaming" to **dwukierunkowy callback**:
+
+1. IDL definiuje **dwa interfejsy** - serwisowy (np. `Catalog`) i obserwatorowy (`BookStream`).
+2. Klient implementuje `BookStream` lokalnie (lokalny servant na lokalnym ObjectAdapter).
+3. Klient w wywolaniu serwisowym przekazuje **proxy do swojego BookStream**.
+4. Serwer **iteruje po wynikach** i wola `observer.onNext(book)`, `observer.onCompleted()` (lub `observer.onError(...)`) - to sa zwykle Ice operacje, ale **w przeciwna strone** niz oryginalne wywolanie.
+
+Wywolanie `findByAuthor` jest twoway - serwer nie zwroci, dopoki `onCompleted()` callback nie odpowie. Wiec po jego zwroceniu klient ma gwarancje, ze wszystkie callbacki zostaly **dostarczone i przetworzone**.
+
+Plus: Ice ma "bidirectional connections" - servery mogą wywolywać callback przez **to samo** TCP, ktorym klient sie polaczyl, bez nowego connect (potrzebne np. za NATem). My nie uzywamy tej optymalizacji, klient wystawia osobny adapter na 127.0.0.1.
+
+#### U nas
+
+**Servant `BookStream` u klienta** [main.py:18-29](client/main.py#L18-L29):
+```python
+class BookStreamI(library.BookStream):
+    def __init__(self):
+        self.q = queue.Queue()
+    def onNext(self, book, current=None):
+        self.q.put(("next", book))
+    def onCompleted(self, current=None):
+        self.q.put(("done", None))
+    def onError(self, code, message, current=None):
+        self.q.put(("error", (code, message)))
+```
+
+`library.BookStream` to bazowa klasa wygenerowana przez `Ice.loadSlice`. Subclassing daje typed servant - Ice wie jak (de)serializowac argumenty (book, code, message) bo mu o tym powiedzielismy w `.ice`.
+
+**Wywolanie i drain queue** [main.py:32-54](client/main.py#L32-L54):
+```python
+def call_find_by_author(communicator, adapter, prx, author, limit, timeout=10.0):
+    servant = BookStreamI()
+    cb_id = Ice.Identity(name="stream-" + uuid.uuid4().hex, category="")
+    cb_prx = library.BookStreamPrx.uncheckedCast(adapter.add(servant, cb_id))
+    try:
+        prx.findByAuthor(library.AuthorQuery(author, limit), cb_prx)
+        # do tego momentu wszystkie callbacki dostarczone i przetworzone
+        results = []
+        while True:
+            kind, val = servant.q.get(timeout=...)
+            if kind == "next": results.append(val)
+            elif kind == "done": return results
+            elif kind == "error":
+                code, msg = val
+                raise RuntimeError(f"findByAuthor stream error: {code}: {msg}")
+    finally:
+        adapter.remove(cb_id)
+```
+
+`adapter.add(servant, identity)` zwraca `Ice.ObjectPrx`, a `library.BookStreamPrx.uncheckedCast(...)` rzutuje na typed proxy do `BookStream`. Ice serializuje to proxy gdy przekazujemy je w argumencie do `findByAuthor`. Serwer otrzymuje `BookStreamPrx` (Java side) i woła na nim onNext/onCompleted - to leci po sieci, lapie nasz `BookStreamI` po stronie klienta.
+
+---
+
+## Zycie wywolania end-to-end
+
+### Bootstrap (jednorazowe, przy `main()`)
 
 ```
-[klient]      call_server_stream(...) zwraca iterator
-              for book in iterator:
-                # leniwe pobieranie - kazdy element to jedna ramka DATA od serwera
-                # grpc-python pulluje z HTTP/2 buffera w miarę konsumpcji (back-pressure HTTP/2 flow-control)
+[main.py:12-14]
+   Ice.loadSlice("-I. -I/path/to/client/ catalog.ice")
+   -> mcpp preprocesor + Slice parser + IcePy.defineStruct/defineSequence/defineProxy/...
+   -> modul `library` zawiera klasy: Book, AddBookRequest, ..., CatalogPrx, BookStream, BookStreamPrx
+   import library
+   -> teraz mamy typed proxy dostepny
 
-[serwer]      [CatalogImpl.scala:47] findByAuthor(request, observer):
-                walidacja
-                for each match:
-                  println(...)
-                  observer.onNext(book)   # serializacja + DATA frame
-                observer.onCompleted()    # trailery {grpc-status: 0}, koniec streama
-              jesli onError(...) zamiast onCompleted -> trailery z error code
+[main.py:151-156]
+   communicator = Ice.initialize(sys.argv)
+   base = communicator.stringToProxy("catalog:tcp -h localhost -p 10000")
+   base.ice_ping()      # sprawdzenie ze serwer zyje (oraz ze "catalog" identity istnieje)
+   base.ice_ids()       # ["::Ice::Object", "::library::Catalog"] - jedyna forma "discovery" w Ice 3.7
+
+[main.py:166-167]
+   prx = library.CatalogPrx.checkedCast(base)
+   -> klient wola prx.ice_isA("::library::Catalog") na serwerze, dostaje True,
+      konstruuje typed proxy CatalogPrx z istniejacych endpoints/identity
+
+[main.py:170-171]
+   adapter = communicator.createObjectAdapterWithEndpoints("CallbackAdapter", "tcp -h 127.0.0.1")
+   adapter.activate()
+   -> klient otwiera lokalny port (przydzielany dynamicznie) na callbacki
+```
+
+### Pojedyncze wywolanie unary AddBook
+
+```
+[main.py] req = library.AddBookRequest(title="Dune", author="Herbert", year=1965, tags=["sf"])
+[main.py] res = prx.addBook(req)
+   -> Ice runtime: serializacja AddBookRequest do encapsulation (dispatcher zna pola z loadSlice'a)
+   -> Send Request frame: [Ice header][reqId][identity="catalog"][operation="addBook"][mode=Normal][context={}][encapsulation(in)]
+   -> serwer odbiera, dispatcher znajduje "addBook" w binarnym indeksie,
+      _iceD_addBook czyta AddBookRequest z encapsulation, wola CatalogImpl.addBook,
+      serializuje AddBookResult jako encapsulation, odsyla Reply frame
+      [reqId][replyStatus=0=OK][encapsulation(out)]
+   -> Ice runtime u klienta deserializuje out -> library.AddBookResult instance
+
+[serwer]  CatalogImpl.addBook:
+   walidacja -> ewentualnie return AddBookResult(0, "INVALID_ARGUMENT", "...")
+   if duplicate -> return AddBookResult(0, "ALREADY_EXISTS", "...")
+   store.put(id, Book(...))
+   println(...)  # log na konsole
+   return AddBookResult(id, "", "")
+
+[main.py] res to library.AddBookResult, czytamy res.bookId / res.errorCode / res.errorMessage
+```
+
+### Pojedyncze wywolanie z callbackiem FindByAuthor
+
+```
+[main.py] adapter = istniejacy CallbackAdapter
+   cb_id = Identity(name="stream-<uuid4>")
+   cb_prx = library.BookStreamPrx.uncheckedCast(adapter.add(BookStreamI(), cb_id))
+
+[main.py] prx.findByAuthor(library.AuthorQuery(author, limit), cb_prx)
+   -> Ice serializuje (AuthorQuery + cb_prx jako proxy) do encapsulation, wysyla
+   -> serwer odbiera, rozpakowuje
+[serwer]  CatalogImpl.findByAuthor(query, observer, current):
+   if invalid -> observer.onError("INVALID_ARGUMENT", "..."); return
+   for each match:
+     observer.onNext(book)     # twoway! - serwer wysyla request DO klienta i CZEKA
+                                # request to: [Ice header][identity="stream-..."][op="onNext"][encaps(book)]
+                                # klient odbiera, BookStreamI.onNext(book) wywolane na adapter thread,
+                                # kolejkuje, odsyla reply z empty encaps
+   observer.onCompleted()      # to samo, ale sygnal koncowy
+   return -> serwer ma onCompleted() ack, zwraca empty reply do klienta
+
+[main.py] po zwrocie z findByAuthor wszystkie callbacki dostarczone, drain queue:
+   while True:
+     kind, val = q.get(timeout)
+     if kind=="next": results.append(val)
+     elif kind=="done": return results
+     elif kind=="error": raise
 ```
 
 ---
 
 ## IDL
 
-[catalog.proto](server/src/main/proto/catalog.proto):
+[server/src/main/slice/catalog.ice](server/src/main/slice/catalog.ice) (ten sam plik jako [client/catalog.ice](client/catalog.ice)):
 
-```protobuf
-syntax = "proto3";
-package catalog;
+```slice
+module library
+{
+    sequence<string> StringSeq;
 
-import "google/protobuf/empty.proto";
+    struct Book          { int id; string title; string author; int year; StringSeq tags; };
 
-service Catalog {
-  rpc AddBook(AddBookRequest) returns (BookId);
-  rpc FindByAuthor(AuthorQuery) returns (stream Book);
-  rpc Summary(google.protobuf.Empty) returns (CatalogStats);
-  rpc RemoveBook(BookId) returns (google.protobuf.Empty);
-}
+    sequence<Book> BookSeq;
+    dictionary<string, int> AuthorCounts;
 
-message Book          { int32 id; string title; string author; int32 year; repeated string tags; }
-message AddBookRequest{ string title; string author; int32 year; repeated string tags; }
-message BookId        { int32 id; }
-message AuthorQuery   { string author; int32 limit; }
-message CatalogStats  { int32 total; map<string,int32> by_author; repeated Book recent; }
+    struct AddBookRequest{ string title; string author; int year; StringSeq tags; };
+    struct AuthorQuery   { string author; int limit; };
+    struct CatalogStats  { int total; AuthorCounts byAuthor; BookSeq recent; };
+    struct AddBookResult    { int  bookId; string errorCode; string errorMessage; };
+    struct RemoveBookResult { bool ok;     string errorCode; string errorMessage; };
+
+    interface BookStream {
+        void onNext(Book book);
+        void onCompleted();
+        void onError(string code, string message);
+    };
+
+    interface Catalog {
+        AddBookResult    addBook(AddBookRequest request);
+        void             findByAuthor(AuthorQuery query, BookStream* observer);
+        CatalogStats     summary();
+        RemoveBookResult removeBook(int id);
+    };
+};
 ```
 
-| RPC | input | output | rodzaj | błędy |
+| Operacja | input | output | rodzaj | bledy |
 |-----|-------|--------|--------|-------|
-| AddBook | AddBookRequest | BookId | unary | `INVALID_ARGUMENT` (puste title/author, year<0), `ALREADY_EXISTS` (duplikat case-insensitive) |
-| FindByAuthor | AuthorQuery | stream Book | server-streaming | `INVALID_ARGUMENT` (puste author) |
-| Summary | google.protobuf.Empty | CatalogStats | unary | - |
-| RemoveBook | BookId | google.protobuf.Empty | unary | `NOT_FOUND` |
+| addBook | AddBookRequest | AddBookResult | unary | `INVALID_ARGUMENT` (puste title/author, year<0), `ALREADY_EXISTS` (duplikat case-insensitive) |
+| findByAuthor | AuthorQuery + BookStream* | void | callback-stream | `INVALID_ARGUMENT` -> `BookStream.onError(code, msg)` |
+| summary | (void) | CatalogStats | unary | - |
+| removeBook | int | RemoveBookResult | unary | `NOT_FOUND` |
 
-`AuthorQuery.limit = 0` traktowane jako "no limit" (proto3 default int32 to 0; sentinel jest standardową konwencją w gRPC API).
+`AuthorQuery.limit = 0` traktowane jako "no limit". Bledy semantyczne sa zwracane **w response Result types**, nie jako Slice exception.
 
-Brak dziedziczenia interfejsów — proto3 nie wspiera dziedziczenia ani usług, ani wiadomości; brief mówi "tam gdzie możliwe i uzasadnione".
-
----
-
-## Compliance vs treść zadania
-
-- [x] **Wywołanie dynamiczne** — klient nie zna IDL przy kompilacji, opiera się o reflection
-- [x] **Brak skompilowanych stubów IDL u klienta** — żadnego `_pb2` z `catalog.proto`. Importowane `descriptor_pb2` i `reflection_pb2` to **meta-protokoły** gRPC (analogia: TCP stack vs. protokół aplikacyjny)
-- [x] **>= 3 operacje** — mamy 4
-- [x] **Nietrywialne struktury** — `repeated string tags`, `map<string,int32> by_author`, `repeated Book recent`
-- [x] **Komunikacja strumieniowa** — `FindByAuthor returns (stream Book)`
-- [x] **Hardcoded calls + parametry z konsoli** — menu czyta input
-- [x] **gRPC + reflection** — `ProtoReflectionService` w serwerze, klient używa reflection v1alpha
-- [x] **grpcurl/Postman** — kompatybilne (instrukcja powyżej)
-- [x] **Dwa różne języki** — Python (klient) vs Scala (serwer)
-- [x] **Dojrzały IDL** — odpowiednie typy (int32, string, repeated, map), gniazdowanie struktur, błędy przez Status, Empty z well-known
-- [x] **Logi konsolowe** — serwer i klient logują każde wywołanie
-- [x] **Stuby w osobnym katalogu** — `server/target/scala-2.13/src_managed/main/scalapb/`
-- [x] **Klient tekstowy, interaktywny** — menu
+Wybor `module library` zamiast `module catalog`: Slice zabrania, by interface i otaczajacy module rozni sie tylko wielkoscia liter.
 
 ---
 
-## Q&A na obronę
+## Compliance vs tresc zadania
 
-### Co to jest "wywołanie dynamiczne" w naszym kontekście?
+> "klient ma nie miec dolaczonych zadnych klas/bibliotek stub bedacych wynikiem kompilacji IDL"
 
-Wywołanie zdalnej procedury, gdzie klient **nie zna kontraktu (IDL) w czasie kompilacji**. Klient wie tylko jak działa protokół (gRPC = HTTP/2 + protobuf wire format) i odkrywa kontrakt w runtime — u nas przez gRPC reflection. Statyczny odpowiednik: klient ma `catalog_pb2.py` skompilowane z `catalog.proto`, kompilator/IDE zna typy, błąd wykrywany przy kompilacji. Tu nic z tego nie ma.
+- [x] Klient nie zawiera **ani jednego** pliku wygenerowanego przez `slice2py` - sprawdzalne `find client -name "*_ice.py"` (nic).
+- [x] Plik `client/catalog.ice` to **plik IDL** (analog `.proto`), nie **stub** - nie jest wynikiem kompilacji, tylko zrodlem.
+- [x] Klasy `library.AddBookRequest`, `library.CatalogPrx` etc. powstaja **w runtime** przez `Ice.loadSlice` -> wewnetrzne `IcePy.defineStruct` API. Nigdy nie istnieja jako pliki na dysku.
+- [x] To jest analogiczne do gRPC `MessageFactory.GetMessageClass(descriptor)` (zada2) - tam tez klasy buduja sie w runtime przez metaklase, ale z `FileDescriptorProto` zamiast z Slice file.
 
-### Czy `descriptor_pb2`/`reflection_pb2` to nie są stuby? Klient ich używa.
+> "kilka (co najmniej trzech) roznych operacji"
 
-Są, ale **stuby meta-protokołu**, nie stuby `catalog.proto`. `grpcurl` napisany w Go też ma skompilowane stuby `descriptor.proto` i `reflection.proto`, a wciąż jest "dynamic". Brief zabrania stubów IDL **aplikacyjnego** — ten warunek spełniamy (zero importów z `catalog.*`).
+- [x] 4 operacje: `addBook`, `findByAuthor`, `summary`, `removeBook`.
 
-### Kiedy reflection jest niedostępny — jak działać?
+> "uzywajacych przynajmniej w jednym przypadku nietrywialnych struktur danych (listy, struktury)"
 
-1. **`FileDescriptorSet` dystrybuowany osobno**: `protoc --descriptor_set_out=catalog.desc catalog.proto`. Klient wczyta `FileDescriptorSet` (definicja w `descriptor.proto`) i użyje tego samego mechanizmu `DescriptorPool.Add(...)` co u nas.
-2. **Centralny rejestr** (Buf Schema Registry, Confluent Schema Registry).
-3. **Statyczne stuby** — wracamy do podejścia kompilowanego.
+- [x] `AddBookRequest.tags: sequence<string>` - lista
+- [x] `CatalogStats.recent: sequence<Book>` - lista struktur
+- [x] `CatalogStats.byAuthor: dictionary<string,int>` - mapa
+- [x] `Book` zagniezdzony w `CatalogStats.recent` - struktura w strukturze
 
-### Wady wywołania dynamicznego
+> "i sposobu komunikacji (gRPC: wywolanie strumieniowe)"
 
-- brak type safety przy kompilacji,
-- brak wsparcia IDE,
-- discovery przy starcie (1 RTT × n plików),
-- reflection ujawnia całe API (security/exposure),
-- "blast radius" — refaktor pól nie wybucha kompilacją u klienta.
+Dla Ice odpowiednikiem jest **bidirectional callback pattern** opisany w [Streaming Interfaces (doc.zeroc.com)](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/streaming-interfaces).
 
-### Kiedy go używać?
+- [x] `findByAuthor` przekazuje `BookStream*` (proxy do callbacku klienta), serwer woła `onNext(book)` per kazdy wynik.
+- [x] Klient implementuje callback przez subclass `library.BookStream` (typed servant) z kolejkowaniem przez `queue.Queue` (lazy iteracja po draine).
 
-Narzędzia ops/dev (grpcurl, Postman), API gateways, generic clients pokrywające wiele serwisów, eksploracja legacy bez dostępu do `.proto`, frameworki testowe wywołujące "wszystkie metody". **Nie** dla zwykłej aplikacyjnej komunikacji — straty produktywności większe niż zyski.
+> "wystarczy zawrzec to wywolanie 'na sztywno' w kodzie zrodlowym, co najwyzej z konsoli parametryzujac szczegoly danych"
 
-### Jak to się ma do ICE Dynamic Invocation?
+- [x] Operacje wpisane na sztywno (`addBook`, `findByAuthor`, `summary`, `removeBook`). Parametry czytane z konsoli przez `input()`.
 
-ICE: `Communicator.stringToProxy` + `ice_invoke(operationName, mode, inParams, outParams)` — bajtowy stream zaszyty ręcznie, klient musi znać sygnatury operacji. Niektóre struktury złożone wymagają stubów po stronie klienta (link "streaming interfaces" w briefie). gRPC dynamic invocation jest "łatwiejsze": protobuf to self-describing format (każde pole ma tag i wire type, więc bez znajomości typu da się przeskoczyć), a reflection dostarcza pełen schemat za darmo.
+> "Trzeba przemyslec i umiec przedyskutowac przydatnosc takiego podejscia w budowie aplikacji rozproszonych"
+
+Zob. [Q&A](#qa-na-obrone) ponizej.
+
+> "Technologia middleware: Ice albo gRPC"
+
+- [x] Ice 3.7.10 (server, slice2java) + 3.7.11 (klient, zeroc-ice z PyPI).
+
+> "Jezyki programowania: dwa rozne"
+
+- [x] Klient: Python 3.12. Serwer: Scala 2.13 (na JVM, korzysta z Java mappingu Ice).
+
+---
+
+## Q&A na obrone
+
+### Co to jest "wywolanie dynamiczne" w naszym kontekscie?
+
+Wywolanie zdalnej procedury, gdzie klient **nie zna kontraktu (Slice IDL) w czasie kompilacji**. Klient zna tylko jak dziala protokol Ice i ma plik IDL ktory dynamicznie laduje przez `Ice.loadSlice` - typy budowane w runtime, bez `slice2py`. Statyczny odpowiednik: klient ma `library_ice.py` skompilowane z `catalog.ice`, kompilator/IDE zna typy, blad wykrywany przy build time. Tu nic z tego nie ma.
+
+### Czemu `Ice.loadSlice` to "dynamic", skoro wymaga pliku `.ice`?
+
+Bo "klucz" w briefie to **nieobecnosc skompilowanych stubow**, nie nieobecnosc samego IDL. Plik `.ice` to **specyfikacja** (rownorzedna z `.proto` w gRPC). Kompilacja IDL produkuje **stuby** (`*_ice.py`, `*_pb2.py`). Tu kompilacji nigdy nie bylo - klasy buduja sie w runtime, nie sa zapisane na dysku.
+
+To jest dokladnie sytuacja analogiczna do **gRPC reflection version** ([zad3/zada2](../zada2/)): tam klient ma `descriptor_pb2.py` (meta-protokol gRPC), nie ma `catalog_pb2.py` (stuby aplikacji), klasy aplikacyjne (`Book`, `BookId`) buduja sie w runtime z `FileDescriptorProto` przez `MessageFactory.GetMessageClass`. **Plik `.proto` u nas tez fizycznie istnieje** - na serwerze, ale **klient go nie kompiluje, tylko pobiera deskryptor przez reflection**.
+
+W naszym Ice case server tez ma `.ice` (po stronie serwera kompilowany przez `slice2java`), klient tez ma kopie `.ice` ale **w runtime tylko ladowana, nie kompilowana**. Roznica vs gRPC reflection: w gRPC server udostepnia deskryptor przez specjalny RPC, a w Ice 3.7 nie ma takiego natywnego RPC -> dystrybuujemy plik out-of-band (najprostsze: tym samym repo).
+
+### Czemu w Pythonie nie uzywasz `ice_invoke` z manual marshalling?
+
+Bo IcePy (zeroc-ice z PyPI) **nie eksponuje** `Ice.OutputStream` / `Ice.InputStream` - to celowa decyzja ZeroC, [udokumentowana w streaming-interfaces (doc.zeroc.com)](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/streaming-interfaces): _"The streaming API is not available in the Python language mapping."_ Brief sam linkuje wlasnie te strone, zeby zwrocic uwage na ograniczenia.
+
+Konsekwencja: w Pythonie pure-DII z manual marshalling (jak w C++/Java/C#) jest niemozliwe - musisz uzyc `Ice.loadSlice` jako jedyna realna sciezka. Ja zrobilbym manual marshalling jakbym pisal klienta w Javie/C++.
+
+### Czemu `findByAuthor` zwraca void zamiast `stream Book` jak w gRPC?
+
+Ice **nie ma** server-streaming w sygnaturze operacji - kazda operacja to 1 req / 1 resp. Streaming w Ice realizowany jest przez **dwukierunkowy callback**: klient przekazuje proxy do swojego `BookStream*`, serwer wola `onNext`, `onCompleted` na nim. To jest **standardowy** wzorzec opisany w doc.zeroc.com (sekcja "Streaming Interfaces").
+
+### Dlaczego bledy zwracane jako pola w response, nie jako Slice exception?
+
+Z dwoch powodow:
+1. **Konsekwencja dla potencjalnego pure DII** (np. gdyby ktos chcial zaadaptowac kod dla klienta C++/Java w trybie manual marshalling): decoding Ice user exception bez wkompilowanej Slice wymaga parsowania slice flags + type ID + slices per kazdy slice w lancuchu dziedziczenia. Result types eliminują ten problem - klient czyta string + string i wie co sie stalo.
+2. **Czytelnosc**: kod typu `if res.errorCode == "NOT_FOUND":` jest jasny.
+
+### Co zastapiloby `proto reflection` w Ice 3.7?
+
+Ice 3.7 nie ma odpowiednika `grpc.reflection.v1alpha`. Najblizsze:
+- `prx.ice_ids()` - lista type ID jakie proxy obsluguje (np. `["::Ice::Object", "::library::Catalog"]`). Ale NIE listuje operacji ani sygnatur.
+- `prx.ice_isA("::library::Catalog")` - bool, czy proxy obsluguje dany interfejs.
+- W Ice 3.8 wprowadzane jest pelne reflection API. W 3.7 - albo mamy Slice file dystrybuowany osobno (klient ladowuje przez `Ice.loadSlice(path)`), albo siegamy po IceGrid Admin Facets.
+
+W naszym kodzie: dystrybuujemy `.ice` osobno (kopia w `client/catalog.ice`), klient laduje runtime.
+
+### Wady wywolania dynamicznego (Ice)
+
+- brak type safety przy build time - blad w `library.AddBookRequest(title=..., author=...)` (np. literowka w polu) wywala dopiero w runtime
+- brak wsparcia IDE dla typed proxy methods (pylint/mypy nie widzi `library.CatalogPrx`)
+- Slice nie jest self-describing wiec klient nie ma jak pominac nieznane pole - **musi zgadzac sie co do schematu**
+- klient i serwer musza miec **identyczne** Slice files albo wpasowane w kompatybilna podsec ich
+- `loadSlice` przy starcie ma overhead (parsowanie + budowa klas)
+- dla Pythona w 3.7 brakuje pure manual marshalling (OutputStream)
+- "blast radius" - refaktor pol nie wybucha kompilacja u klienta
+
+### Kiedy uzywac
+
+Narzedzia ops/dev (analog grpcurl, ale dla Ice nie ma oficjalnego ekwiwalentu - mozna sobie zbudowac przez `loadSlice` + reflection-like via `ice_ids`), API gateways, generic clients pokrywajace wiele serwisow, frameworki testowe wywolujace "wszystkie metody". **Nie** dla zwyklej aplikacyjnej komunikacji - straty produktywnosci wieksze niz zyski.
+
+### Jak to sie ma do gRPC dynamic invocation z `zada2`?
+
+| | gRPC reflection (zada2) | Ice loadSlice (zadi1) |
+|---|---|---|
+| Skad klient ma schemat | `ServerReflection.GetFileDescriptorProto` per pytanie | plik `.ice` dystrybuowany osobno (out-of-band) |
+| API u klienta | `channel.unary_unary(path, ser, deser)` z `MessageFactory.GetMessageClass` | `library.CatalogPrx.checkedCast(prx).addBook(req)` (typed) z `Ice.loadSlice` |
+| Stuby u klienta | brak (build w runtime przez metaklase z FileDescriptorProto) | brak (build w runtime przez IcePy.defineStruct z parsowanego .ice) |
+| Wire format | self-describing (tag + wire type) - mozna pominac nieznane pole | strict layout (kolejnosc+typy musi sie zgadzac) |
+| Discovery operacji | TAK - reflection zwraca pelen ServiceDescriptor z metodami | NIE - klient zna z out-of-band |
+| Streaming | natywne `unary_stream` w sygnaturze | brak natywnego, bidirectional callback przez 2 interfejsy |
+| Bledy | gRPC Status (codes) | Result types z polami errorCode/errorMessage |
+
+Wnioski:
+- **gRPC ma latwiejszy dynamic invocation** dzieki self-describing format + reflection
+- **Ice DII jest blizej "metalu"** - wymaga rozproszenia `.ice` i ma mniej introspekcji
+- **Oba spelniaja brief** "klient bez stubow IDL", ale w Ice trzeba wiecej setup'u
 
 ### Backward/forward compatibility?
 
-Protobuf zachowuje nieznane pola (proto3) lub odrzuca (proto2 strict). Nasz dynamic klient po pobraniu deskryptora automatycznie nadąża za zmianami serwera bez rekompilacji. Statyczny klient z starym `_pb2.py` ignoruje nowe pola, ale wciąż działa (forward compat).
+Ice (encoding 1.1) ma mechanism **slicing classes** dla klas (nie struct), ale dla naszych prostych structow zmiana kolejnosci pola = lamie kompatybilnosc bezwarunkowo. Dla porownania: protobuf z tagami toleruje zmiany dodajace pola.
 
-### Bezpieczeństwo reflection w produkcji?
+### Bezpieczenstwo introspekcji w produkcji?
 
-Reflection ujawnia całe API. Na publicznych endpointach typowo wyłączamy lub gateway'em filtrujemy. Wewnątrz klastra (mTLS, sieć prywatna) zazwyczaj włączona — narzędzia ops/dev są bezcenne.
+`ice_ids` ujawnia tylko typ interfejsu (`::library::Catalog`), nie operacje ani struktury. To jest **mniej** info-leak niz gRPC reflection (ktore ujawnia caly schemat). Wiec na publicznych endpointach Ice ma latwiej.
 
-### TOCTOU w sprawdzaniu duplikatów na serwerze?
+### TOCTOU w sprawdzaniu duplikatow?
 
-W [`addBook`](server/src/main/scala/CatalogImpl.scala#L26-L33) sekwencja `store.values.exists(...)` → `store.put(...)` nie jest atomowa. Przy bardzo szybkich równoczesnych Add tej samej książki możliwy duplikat. Dla demo niegroźne; produkcyjnie `synchronized` na sekcji "check + put", albo struktura z deterministycznym kluczem (title+author lower) i `putIfAbsent`.
+W [`addBook`](server/src/main/scala/CatalogImpl.scala) sekwencja `store.values.exists(...) -> store.put(...)` nie jest atomowa. Przy bardzo szybkich rownoczesnych Add tej samej ksiazki mozliwy duplikat. Dla demo niegroźne; produkcyjnie `synchronized` na sekcji "check + put", albo struktura z deterministycznym kluczem (title+author lower) i `putIfAbsent`.
 
-### Co się stanie po `Ctrl+C` w kliencie / serwerze?
+### Co sie stanie po `Ctrl+C` w kliencie / serwerze?
 
-Klient: `input()` rzuca `KeyboardInterrupt`, łapane w menu, czysty exit. Serwer: `sys.addShutdownHook` woła `server.shutdown()` → graceful drain w gRPC-Java (nowe RPC odrzucane, in-flight kończą się). Brak `awaitTermination` po shutdownie => proces może wyjść tuż po, zanim długie streamy się skończą; przy długich streamach dodać `server.awaitTermination(5, SECONDS)` w hooku.
+Klient: `input()` rzuca `KeyboardInterrupt`, lapane w menu, czysty exit przez `communicator.destroy()`. Serwer: `Runtime.addShutdownHook` wola `communicator.shutdown()` -> graceful stop adaptera, in-flight RPC dokonczone.
 
-### Co jeśli klient wyceluje w zły adres / port / serwer bez reflection?
+### Co jesli klient wyceluje w zly endpoint / serwer bez tej identity?
 
-Złapane w `main()` jako `grpc.RpcError`, drukujemy `code=...` + `details=...`, exit 1. Zweryfikowane:
-- wrong port → `UNAVAILABLE: Connection refused`
-- istniejący serwer bez reflection (np. zada2 na 50051) → `UNIMPLEMENTED: Method not found: grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo`
-- nieistniejący host → `UNAVAILABLE: DNS lookup failed`
+Zlapane jako `Ice.LocalException`:
+- wrong port -> `Ice.ConnectionRefusedException`
+- istniejacy serwer ale brak identity "catalog" -> `Ice.ObjectNotExistException` (replyStatus=2 w protokole)
+- nieistniejacy host -> `Ice.DNSException` lub `Ice.ConnectFailedException`
+- wrong endpoint syntax -> `Ice.EndpointParseException` przy `stringToProxy`
 
-### Najszybsza ścieżka demo
+### Najszybsza sciezka demo
 
-1. `tree zad4/zadi1` — pokazać brak `_pb2`/`catalog/` w `client/`
-2. `cd server && sbt run` (port 50061, log "listening on")
-3. Drugi terminal: `cd client && .venv/bin/python tests.py` → 36/36 PASS
-4. `.venv/bin/python main.py`, opcja **5** (lista usług+metod **z reflection**, nie z lokalnego źródła)
-5. AddBook, FindByAuthor (zwrócić uwagę na "stream"), Summary (`by_author` map + `recent` list), RemoveBook nieistniejącego id → NOT_FOUND
-6. Trzeci terminal: `grpcurl -plaintext localhost:50061 list` / `describe` → ten sam wynik co Python
-7. Postman z reflection → ten sam wynik
-8. Pokazać w `client/main.py`:
-   - linie 43-60 (`load_pool`) — post-order DFS po deps z reflection
-   - linie 63-73 (`Method`) — kapsuje runtime-built klasy + ścieżkę RPC
-   - linie 85-100 (`call_unary`/`call_server_stream`) — generic `channel.unary_unary` / `unary_stream`
-9. Podkreślić: te 60 linii to cały dynamic invocation. Reszta to UI menu, error handling, parsowanie inputu.
+1. `tree zad3/zadi1` - pokazac `client/main.py` + `client/tests.py` + `client/catalog.ice` - **zadnego `library/` ani `*_ice.py`** w `client/`
+2. `cd server && sbt run` (port 10000)
+3. Drugi terminal: `cd client && .venv/bin/python tests.py` -> 42/42 PASS
+4. `.venv/bin/python main.py`, opcje 1-4 demo: addBook, findByAuthor (zwrocic uwage na bidirectional callback), summary, removeBook
+5. Pokazac w `client/main.py`:
+   - linie 12-15 (`Ice.loadSlice` + `import library`) - **runtime IDL loading**
+   - linie 18-29 (`BookStreamI(library.BookStream)`) - typed servant subclass
+   - linie 32-54 (`call_find_by_author`) - przekazanie cb_prx do serwera + drain queue
+6. Podkreslic: nie ma `slice2py` w pipeline, klasy `library.*` istnieja **tylko w pamieci** po `Ice.loadSlice`.
+
+### Czemu `module library` zamiast `module catalog`?
+
+Slice zabrania, by interface i otaczajacy go module rozni sie tylko wielkoscia liter:
+```
+$ slice2java catalog.ice
+catalog.ice:60: interface name `Catalog' cannot differ only in capitalization from its immediately enclosing module name `catalog'
+```
+
+Stad `module library`. Logicznie pasuje (system biblioteczny).

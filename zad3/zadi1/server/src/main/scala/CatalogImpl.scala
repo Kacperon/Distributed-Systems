@@ -1,88 +1,78 @@
-package catalog
+package library
 
-import com.google.protobuf.empty.Empty
-import io.grpc.Status
-import io.grpc.stub.StreamObserver
+import com.zeroc.Ice.Current
 
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
+import scala.jdk.CollectionConverters._
 
-class CatalogImpl(implicit ec: ExecutionContext) extends CatalogGrpc.Catalog {
-  private val store = TrieMap.empty[Int, Book]
-  private val nextId = new AtomicInteger(1)
+class CatalogImpl extends Catalog {
+  private val store = new ConcurrentHashMap[Integer, Book]()
+  private val nextId = new AtomicInteger(0)
 
-  override def addBook(request: AddBookRequest): Future[BookId] = Future {
-    if (request.title.trim.isEmpty || request.author.trim.isEmpty) {
-      throw Status.INVALID_ARGUMENT
-        .withDescription("title and author must not be empty")
-        .asRuntimeException()
-    }
-    if (request.year < 0) {
-      throw Status.INVALID_ARGUMENT
-        .withDescription("year must be non-negative")
-        .asRuntimeException()
-    }
-    val duplicate = store.values.exists(b =>
+  override def addBook(request: AddBookRequest, current: Current): AddBookResult = {
+    if (request.title == null || request.title.trim.isEmpty)
+      return new AddBookResult(0, "INVALID_ARGUMENT", "title must not be empty")
+    if (request.author == null || request.author.trim.isEmpty)
+      return new AddBookResult(0, "INVALID_ARGUMENT", "author must not be empty")
+    if (request.year < 0)
+      return new AddBookResult(0, "INVALID_ARGUMENT", "year must be non-negative")
+
+    val tags = if (request.tags == null) Array.empty[String] else request.tags
+
+    val duplicate = store.values.iterator.asScala.exists { b =>
       b.title.equalsIgnoreCase(request.title) && b.author.equalsIgnoreCase(request.author)
-    )
-    if (duplicate) {
-      throw Status.ALREADY_EXISTS
-        .withDescription(s"book '${request.title}' by '${request.author}' already exists")
-        .asRuntimeException()
     }
-    val id = nextId.getAndIncrement()
-    val book = Book(
-      id = id,
-      title = request.title,
-      author = request.author,
-      year = request.year,
-      tags = request.tags
-    )
+    if (duplicate)
+      return new AddBookResult(0, "ALREADY_EXISTS", s"book '${request.title}' by '${request.author}' already exists")
+
+    val id = nextId.incrementAndGet()
+    val book = new Book(id, request.title, request.author, request.year, tags)
     store.put(id, book)
-    println(s"[catalog] AddBook id=$id title='${request.title}' author='${request.author}'")
-    BookId(id = id)
+    println(s"[catalog] addBook id=$id title='${request.title}' author='${request.author}'")
+    new AddBookResult(id, "", "")
   }
 
-  override def findByAuthor(request: AuthorQuery, responseObserver: StreamObserver[Book]): Unit = {
-    println(s"[catalog] FindByAuthor author='${request.author}' limit=${request.limit}")
-    if (request.author.trim.isEmpty) {
-      responseObserver.onError(
-        Status.INVALID_ARGUMENT
-          .withDescription("author must not be empty")
-          .asRuntimeException()
-      )
-    } else {
-      val needle = request.author.toLowerCase
-      val matches = store.values.toList
-        .filter(_.author.toLowerCase.contains(needle))
-        .sortBy(_.id)
-      val limited = if (request.limit > 0) matches.take(request.limit) else matches
+  override def findByAuthor(query: AuthorQuery, observer: BookStreamPrx, current: Current): Unit = {
+    println(s"[catalog] findByAuthor author='${query.author}' limit=${query.limit}")
+    if (observer == null) return
+    if (query.author == null || query.author.trim.isEmpty) {
+      observer.onError("INVALID_ARGUMENT", "author must not be empty")
+      return
+    }
+    val needle = query.author.toLowerCase
+    val matches = store.values.iterator.asScala.toList
+      .filter(_.author.toLowerCase.contains(needle))
+      .sortBy(_.id)
+    val limited = if (query.limit > 0) matches.take(query.limit) else matches
+    try {
       limited.foreach { b =>
         println(s"[catalog]   -> id=${b.id} '${b.title}'")
-        responseObserver.onNext(b)
+        observer.onNext(b)
       }
-      responseObserver.onCompleted()
+      observer.onCompleted()
+    } catch {
+      case e: com.zeroc.Ice.LocalException =>
+        println(s"[catalog]   stream observer failed: ${e.getMessage}")
     }
   }
 
-  override def summary(request: Empty): Future[CatalogStats] = Future {
-    println("[catalog] Summary")
-    val all = store.values.toList
-    val byAuthor = all.groupBy(_.author).view.mapValues(_.size).toMap
-    val recent = all.sortBy(-_.id).take(5)
-    CatalogStats(total = all.size, byAuthor = byAuthor, recent = recent)
+  override def summary(current: Current): CatalogStats = {
+    println("[catalog] summary")
+    val all = store.values.iterator.asScala.toList
+    val byAuthor: java.util.Map[String, Integer] =
+      all.groupBy(_.author).map { case (k, v) => (k, Integer.valueOf(v.size)) }.asJava
+    val recent = all.sortBy(-_.id).take(5).toArray
+    new CatalogStats(all.size, byAuthor, recent)
   }
 
-  override def removeBook(request: BookId): Future[Empty] = Future {
-    store.remove(request.id) match {
-      case Some(b) =>
-        println(s"[catalog] RemoveBook id=${request.id} title='${b.title}'")
-        Empty()
-      case None =>
-        throw Status.NOT_FOUND
-          .withDescription(s"book id=${request.id} not found")
-          .asRuntimeException()
+  override def removeBook(id: Int, current: Current): RemoveBookResult = {
+    val removed = store.remove(id)
+    if (removed == null) {
+      new RemoveBookResult(false, "NOT_FOUND", s"book id=$id not found")
+    } else {
+      println(s"[catalog] removeBook id=$id title='${removed.title}'")
+      new RemoveBookResult(true, "", "")
     }
   }
 }
