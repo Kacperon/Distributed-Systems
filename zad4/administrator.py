@@ -34,7 +34,7 @@ def consumer():
 def main():
     threading.Thread(target=consumer, daemon=True).start()
 
-    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST))
+    conn = pika.BlockingConnection(pika.ConnectionParameters(host=HOST, heartbeat=0))
     ch = conn.channel()
     ch.exchange_declare(exchange=EXCHANGE, exchange_type='topic')
 
