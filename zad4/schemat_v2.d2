@@ -1,0 +1,77 @@
+title: |md
+  # System posrednictwa - RabbitMQ (v2)
+  topic exchange `space.events`, klucze: `order.<typ>`, `confirm.<agencja>`, `broadcast.<grupa>`
+| {near: top-center}
+
+classes: {
+  agency:   { shape: person; style.fill: "#bfdbfe" }
+  carrier:  { shape: person; style.fill: "#fde68a" }
+  admin:    { shape: person; style.fill: "#fca5a5" }
+  workq:    { shape: queue; style.fill: "#fde68a" }
+  agencyq:  { shape: queue; style.fill: "#bfdbfe" }
+  carrierq: { shape: queue; style.fill: "#fde68a" }
+  adminq:   { shape: queue; style.fill: "#fca5a5" }
+  ord:  { style.stroke: "#1d4ed8"; style.stroke-width: 2 }
+  conf: { style.stroke: "#a16207"; style.stroke-width: 2 }
+  brd:  { style.stroke: "#b91c1c"; style.stroke-width: 2 }
+  cons-work:   { style.stroke: "#ea580c"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-agency: { style.stroke: "#2563eb"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-carrier:{ style.stroke: "#ca8a04"; style.stroke-dash: 5; style.stroke-width: 2 }
+  cons-admin:  { style.stroke: "#dc2626"; style.stroke-dash: 5; style.stroke-width: 2 }
+}
+
+NASA: "Agencja NASA" { class: agency }
+ESA:  "Agencja ESA"  { class: agency }
+C1:   "Przewoznik C1\n[osoby, ladunek]"   { class: carrier }
+C2:   "Przewoznik C2\n[ladunek, satelita]" { class: carrier }
+ADM:  "Administrator" { class: admin }
+
+Q_OS:   "service.osoby"    { class: workq }
+Q_LA:   "service.ladunek"  { class: workq }
+Q_SA:   "service.satelita" { class: workq }
+Q_NASA: "agency.NASA"      { class: agencyq }
+Q_ESA:  "agency.ESA"       { class: agencyq }
+Q_C1:   "carrier.C1"       { class: carrierq }
+Q_C2:   "carrier.C2"       { class: carrierq }
+Q_ADM:  "admin.<auto>\n(kopia wszystkiego)" { class: adminq }
+
+# publish: aktor -> kolejka (routing key na etykiecie)
+NASA -> Q_OS: "order.osoby"    { class: ord }
+NASA -> Q_LA: "order.ladunek"  { class: ord }
+NASA -> Q_SA: "order.satelita" { class: ord }
+ESA  -> Q_OS: "order.osoby"    { class: ord }
+ESA  -> Q_LA: "order.ladunek"  { class: ord }
+ESA  -> Q_SA: "order.satelita" { class: ord }
+C1 -> Q_NASA: "confirm.NASA" { class: conf }
+C1 -> Q_ESA:  "confirm.ESA"  { class: conf }
+C2 -> Q_NASA: "confirm.NASA" { class: conf }
+C2 -> Q_ESA:  "confirm.ESA"  { class: conf }
+ADM -> Q_NASA: "broadcast.{agencies,all}" { class: brd }
+ADM -> Q_ESA:  "broadcast.{agencies,all}" { class: brd }
+ADM -> Q_C1:   "broadcast.{carriers,all}" { class: brd }
+ADM -> Q_C2:   "broadcast.{carriers,all}" { class: brd }
+
+# consume: kolejka -> aktor
+Q_NASA -> NASA { class: cons-agency }
+Q_ESA  -> ESA  { class: cons-agency }
+Q_OS -> C1 { class: cons-work }
+Q_LA -> C1 { class: cons-work }
+Q_LA -> C2 { class: cons-work }
+Q_SA -> C2 { class: cons-work }
+Q_C1 -> C1 { class: cons-carrier }
+Q_C2 -> C2 { class: cons-carrier }
+Q_ADM -> ADM { class: cons-admin }
+
+legend: "Legenda" {
+  near: bottom-right
+  shape: rectangle
+  grid-columns: 1
+  grid-gap: 4
+  l1: "ciagle niebieskie - zlecenia (order.*)"            { shape: text; style.font-color: "#1d4ed8" }
+  l2: "ciagle brazowe - potwierdzenia (confirm.*)"        { shape: text; style.font-color: "#a16207" }
+  l3: "ciagle czerwone - administrator (broadcast.*)"     { shape: text; style.font-color: "#b91c1c" }
+  l4: "kreskowane pomaranczowe - consume z service.*"      { shape: text; style.font-color: "#ea580c" }
+  l5: "kreskowane niebieskie - consume z agency.*"         { shape: text; style.font-color: "#2563eb" }
+  l6: "kreskowane zolte - consume z carrier.*"             { shape: text; style.font-color: "#ca8a04" }
+  l7: "kreskowane czerwone - consume z admin.<auto>"       { shape: text; style.font-color: "#dc2626" }
+}
