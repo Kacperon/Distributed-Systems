@@ -234,10 +234,12 @@ DII.
 
 ### 3.2 Ktorego my uzywamy
 
-**Schemat B (loadSlice)** - jako, ze w Pythonie A nie istnieje.
+**Glownie schemat B (loadSlice)** - bo wysokopoziomowe API streaming
+nie jest w IcePy. **Dodatkowo bonusowo schemat A** dla jednej operacji
+(`removeBook`) - skladamy bajty rosrednio bez OutputStream.
 
 ```python
-# main.py linie 12-14
+# main.py
 SLICE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog.ice")
 Ice.loadSlice(f"-I. -I{os.path.dirname(SLICE_FILE)} {SLICE_FILE}")
 import library
@@ -246,6 +248,54 @@ import library
 Po tym `library.AddBookRequest`, `library.CatalogPrx`, `library.BookStream`
 istnieja **w pamieci**. Plik `library_ice.py` na dysku **nie istnieje**
 (zaden `slice2py` nie byl odpalany).
+
+Menu w `main.py` pokazuje to jeszcze mocniej - nazwy operacji wyciagamy
+przez `dir(library.CatalogPrx)` w `discover_business_ops()`. Gdyby
+`loadSlice` nie zadzialal, lista by byla pusta. Linia w demo:
+```
+discovered business ops on library.CatalogPrx: ['addBook', 'findByAuthor', 'removeBook', 'summary']
+```
+
+### 3.2a Schemat A bez OutputStream - workaround przez struct.pack
+
+IcePy nie ma OutputStream/InputStream, ale `prx.ice_invoke()` jest. Wiec
+zbudujemy encapsulation **recznie** przez `struct.pack`, a odpowiedz
+sparsujemy bajt po bajcie wedlug encoding 1.1.
+
+Operacja: `removeBook(int id) -> RemoveBookResult{bool ok, string err, string msg}`.
+
+**Marshal in-params** (int -> encapsulation):
+```python
+payload = struct.pack("<i", bid)                        # 4B little-endian int
+in_bytes = struct.pack("<I", 4 + 2 + len(payload))      # encap size = 4 (size sam) + 2 (encoding) + payload
+in_bytes += b"\x01\x01"                                 # encoding 1.1
+in_bytes += payload
+ok, reply = prx.ice_invoke("removeBook", Ice.OperationMode.Normal, in_bytes)
+```
+
+Dla `bid=128` to dokladnie 10 bajtow: `0a 00 00 00 01 01 80 00 00 00`
+(widac w demo).
+
+**Unmarshal reply** (encap -> bool + 2 stringi):
+```python
+off = 6                                                  # skip 4B size + 2B encoding
+res_ok = bool(reply[off]); off += 1
+err_code, off = _read_ice_string(reply, off)             # size byte + UTF-8
+err_msg,  off = _read_ice_string(reply, off)
+```
+
+`_read_ice_string` implementuje Ice 1.1 string encoding: 1 bajt size
+(0..254) lub `0xff` + 4-bajtowy LE int dla > 254 znakow.
+
+Dla success: 9 bajtow `09 00 00 00 01 01 01 00 00` (encap-size 9,
+enc 1.1, bool=true, 2x empty string).
+
+Dla NOT_FOUND: 43 bajty - widac `09` (=length of "NOT_FOUND") + ASCII
+`4e 4f 54 5f 46 4f 55 4e 44`, potem `19` (=25) + ASCII komunikatu.
+
+**Pointe**: pure-DII w Pythonie **jest mozliwe**, tylko bez wygodnego
+API. Streaming interfaces sa wygodne, ale niepotrzebne - encapsulation
+to po prostu `[size:4][encoding:2][payload]`.
 
 ### 3.3 Czemu to jest "dynamic"?
 
@@ -501,9 +551,14 @@ niz zyski.
    przez `slice2py` - tego u nas nie ma.
 
 3. **Czemu nie uzywasz `ice_invoke` z manual marshalling?**
-   IcePy nie eksponuje `Ice.OutputStream`/`Ice.InputStream` - celowa decyzja
-   ZeroC, [udokumentowana](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/streaming-interfaces).
-   Pure-DII z manual marshalling jest mozliwe **tylko w C++/Java/C#/JS**.
+   Uzywam - dla bonusu na operacji `removeBook` w menu (pozycja 7).
+   IcePy nie eksponuje `Ice.OutputStream`/`Ice.InputStream`
+   ([dokumentacja ZeroC](https://doc.zeroc.com/ice/3.7/client-server-features/dynamic-ice/streaming-interfaces)),
+   ale samo `prx.ice_invoke()` jest. Wiec sklada sie encapsulation
+   recznie przez `struct.pack` (`"<I"` size + `"\x01\x01"` encoding 1.1 +
+   payload) i parsuje reply bajt po bajcie. Sekcja 3.2a w notatce ma
+   pelny hex breakdown. Glowne 4 operacje ida przez loadSlice (Schemat
+   B) bo to czystsze.
 
 4. **Czemu Result types zamiast Slice exceptions?** Czytelnosc + spojnosc
    (kod typu `if res.errorCode == "NOT_FOUND"` jest jasny). Decoding Ice
@@ -611,9 +666,13 @@ niz zyski.
     natywnego streamingu w sygnaturze, opisuje wzorzec "callback object",
     i wprost stwierdza ze "streaming API not available in Python language mapping".
 
-25. **Czemu w Pythonie wybralem loadSlice a nie ice_invoke z manual?** Bo
-    manual marshalling nie jest dostepne w IcePy. To **techniczne ograniczenie**,
-    ktore brief wprost wskazuje przez link do streaming-interfaces.
+25. **Czemu w Pythonie wybralem loadSlice a nie ice_invoke z manual?**
+    Glowny path - loadSlice (Schemat B), bo high-level streaming API
+    nie jest w IcePy. Ale dla pokazania ze rozumiem Schemat A, w menu
+    jest pozycja 7 (`removeBook[ice_invoke]`) ktora robi encapsulation
+    przez `struct.pack` i parsuje reply bajt po bajcie. To dziala bo
+    `ice_invoke` samo w sobie jest w IcePy, tylko brakuje wygodnych
+    klas OutputStream/InputStream do skladania payloadu.
 
 ## 9. Mapping problemow rozproszenia
 
@@ -640,4 +699,4 @@ niz zyski.
 | ice grid (load balancing) | IceGrid registry + nodes |
 | obserwability | Metrics admin facet |
 | reflection w 3.7 | osobny "describeApi" operation w Slice + dystrybuowany `.ice` z `Ice.loadSlice` na podstawie odpowiedzi |
-| pure-DII w Pythonie | przejscie na 3.8 (jak doda OutputStream w Pythonie) lub zmiana klienta na C++/Java |
+| pure-DII w Pythonie | u nas: workaround przez `struct.pack` dla `removeBook[ice_invoke]` (menu 7). W prodzie: przejscie na 3.8 z natywnym OutputStream lub C++/Java klient. |

@@ -1,4 +1,5 @@
 import os
+import struct
 import sys
 import uuid
 import queue
@@ -90,21 +91,145 @@ def read_csv(prompt):
     return [t.strip() for t in s.split(",")]
 
 
-OPERATIONS = [
-    ("addBook", "AddBookRequest", "AddBookResult"),
-    ("findByAuthor", "AuthorQuery + BookStream*", "void (stream via callback)"),
-    ("summary", "void", "CatalogStats"),
-    ("removeBook", "int", "RemoveBookResult"),
+def op_add_book(prx, **_):
+    title = input("title: ").strip()
+    author = input("author: ").strip()
+    year = read_int("year (int): ")
+    tags = read_csv("tags (comma-separated, optional): ")
+    req = library.AddBookRequest(title, author, year, tags)
+    res = prx.addBook(req)
+    if res.errorCode:
+        print(f"  ERROR {res.errorCode}: {res.errorMessage}")
+    else:
+        print(f"  bookId={res.bookId}")
+
+
+def op_find_by_author(prx, communicator, adapter):
+    author = input("author: ").strip()
+    limit = read_int("limit (0 = no limit): ")
+    results = call_find_by_author(communicator, adapter, prx, author, limit)
+    print(f"streamed {len(results)} books:")
+    for b in results:
+        print_book(b, 1)
+
+
+def op_summary(prx, **_):
+    stats = prx.summary()
+    print("response:")
+    print_stats(stats)
+
+
+def op_remove_book(prx, **_):
+    bid = read_int("book id (int): ")
+    res = prx.removeBook(bid)
+    if res.errorCode:
+        print(f"  ERROR {res.errorCode}: {res.errorMessage}")
+    else:
+        print(f"  removed (ok={res.ok})")
+
+
+def op_ice_ids(prx, **_):
+    ids = prx.ice_ids()
+    print("ice_ids:")
+    for x in ids:
+        print(f"  {x}")
+
+
+def op_ice_ping(prx, **_):
+    prx.ice_ping()
+    print("ice_ping: OK")
+
+
+def _read_ice_string(buf, off):
+    n = buf[off]
+    off += 1
+    if n == 255:
+        n = struct.unpack_from("<I", buf, off)[0]
+        off += 4
+    return buf[off:off + n].decode("utf-8"), off + n
+
+
+def op_remove_book_invoke(prx, **_):
+    bid = read_int("book id (int): ")
+
+    payload = struct.pack("<i", bid)
+    encap_size = 4 + 2 + len(payload)
+    in_bytes = struct.pack("<I", encap_size) + b"\x01\x01" + payload
+    print(f"  marshaled in-params: {len(in_bytes)} bytes  ({in_bytes.hex()})")
+    print(f"    layout: [size:4={encap_size}] [encoding:2=1.1] [int32:4={bid}]")
+
+    ok, reply = prx.ice_invoke("removeBook", Ice.OperationMode.Normal, in_bytes)
+    print(f"  ice_invoke returned ok={ok}, reply: {len(reply)} bytes  ({reply.hex()})")
+
+    off = 6
+    res_ok = bool(reply[off])
+    off += 1
+    err_code, off = _read_ice_string(reply, off)
+    err_msg, off = _read_ice_string(reply, off)
+    print(f"    unmarshaled: bool={res_ok}, errorCode={err_code!r}, errorMessage={err_msg!r}")
+
+    if err_code:
+        print(f"  ERROR {err_code}: {err_msg}  [via ice_invoke + manual struct]")
+    else:
+        print(f"  removed (ok={res_ok})  [via ice_invoke + manual struct]")
+
+
+BUSINESS_OP_HANDLERS = {
+    "addBook": ("AddBookRequest", "AddBookResult", op_add_book),
+    "findByAuthor": ("AuthorQuery + BookStream*", "void (stream via callback)", op_find_by_author),
+    "summary": ("void", "CatalogStats", op_summary),
+    "removeBook": ("int", "RemoveBookResult", op_remove_book),
+}
+
+INTROSPECTION_OPS = [
+    ("ice_ids", "void", "StringSeq", op_ice_ids),
+    ("ice_ping", "void", "void", op_ice_ping),
+]
+
+DYNAMIC_INVOCATION_OPS = [
+    ("removeBook[ice_invoke]", "int (manual OutputStream)", "RemoveBookResult (manual InputStream)", op_remove_book_invoke),
 ]
 
 
+def discover_business_ops(proxy_cls):
+    skip_exact = {"checkedCast", "uncheckedCast"}
+    skip_prefix = ("ice_", "begin_", "end_", "_")
+    out = []
+    for n in sorted(dir(proxy_cls)):
+        if n in skip_exact:
+            continue
+        if n.endswith("Async"):
+            continue
+        if any(n.startswith(p) for p in skip_prefix):
+            continue
+        if callable(getattr(proxy_cls, n)):
+            out.append(n)
+    return out
+
+
 def menu_loop(communicator, adapter, prx):
+    discovered = discover_business_ops(library.CatalogPrx)
+    print(f"discovered business ops on library.CatalogPrx: {discovered}")
+
+    entries = []
+    for name in discovered:
+        spec = BUSINESS_OP_HANDLERS.get(name)
+        if spec is None:
+            entries.append((name, "?", "?", None))
+        else:
+            in_t, out_t, fn = spec
+            entries.append((name, in_t, out_t, fn))
+    for name, in_t, out_t, fn in INTROSPECTION_OPS:
+        entries.append((name, in_t, out_t, fn))
+    for name, in_t, out_t, fn in DYNAMIC_INVOCATION_OPS:
+        entries.append((name, in_t, out_t, fn))
+
+    dispatch = {str(i + 1): e for i, e in enumerate(entries)}
+
     while True:
         print("\navailable operations:")
-        for i, (name, in_t, out_t) in enumerate(OPERATIONS, 1):
+        for i, (name, in_t, out_t, _) in enumerate(entries, 1):
             print(f"  {i}) {name}    in={in_t}    out={out_t}")
-        print("  5) ice_ids  (introspection)")
-        print("  6) ice_ping (introspection)")
         print("  q) quit")
         try:
             choice = input("> ").strip()
@@ -113,46 +238,16 @@ def menu_loop(communicator, adapter, prx):
             return
         if choice in ("q", "quit", "exit"):
             return
+        entry = dispatch.get(choice)
+        if entry is None:
+            print("invalid choice")
+            continue
+        name, _, _, fn = entry
+        if fn is None:
+            print(f"  no handler wired for op {name!r}")
+            continue
         try:
-            if choice == "1":
-                title = input("title: ").strip()
-                author = input("author: ").strip()
-                year = read_int("year (int): ")
-                tags = read_csv("tags (comma-separated, optional): ")
-                req = library.AddBookRequest(title, author, year, tags)
-                res = prx.addBook(req)
-                if res.errorCode:
-                    print(f"  ERROR {res.errorCode}: {res.errorMessage}")
-                else:
-                    print(f"  bookId={res.bookId}")
-            elif choice == "2":
-                author = input("author: ").strip()
-                limit = read_int("limit (0 = no limit): ")
-                results = call_find_by_author(communicator, adapter, prx, author, limit)
-                print(f"streamed {len(results)} books:")
-                for b in results:
-                    print_book(b, 1)
-            elif choice == "3":
-                stats = prx.summary()
-                print("response:")
-                print_stats(stats)
-            elif choice == "4":
-                bid = read_int("book id (int): ")
-                res = prx.removeBook(bid)
-                if res.errorCode:
-                    print(f"  ERROR {res.errorCode}: {res.errorMessage}")
-                else:
-                    print(f"  removed (ok={res.ok})")
-            elif choice == "5":
-                ids = prx.ice_ids()
-                print("ice_ids:")
-                for x in ids:
-                    print(f"  {x}")
-            elif choice == "6":
-                prx.ice_ping()
-                print("ice_ping: OK")
-            else:
-                print("invalid choice")
+            fn(prx, communicator=communicator, adapter=adapter)
         except Ice.LocalException as e:
             print(f"ice error: {type(e).__name__}: {e}")
         except RuntimeError as e:
